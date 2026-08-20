@@ -1,0 +1,3 @@
+[submodule "llm-fingerprint-detector"]
+	path = llm-fingerprint-detector
+	url = https://github.com/ToseaAI/llm-fingerprint-detector.git

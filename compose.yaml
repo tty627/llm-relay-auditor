@@ -1,0 +1,39 @@
+name: relay-model-auditor
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: relay_auditor
+      POSTGRES_USER: auditor
+      POSTGRES_PASSWORD: local-only-change-me
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U auditor -d relay_auditor"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  auditor:
+    build: .
+    environment:
+      AUDITOR_DATABASE_URL: postgresql+psycopg://auditor:local-only-change-me@postgres:5432/relay_auditor
+      AUDITOR_EVIDENCE_DIR: /app/data/evidence
+      AUDITOR_FINGERPRINT_CLI_PATH: /app/llm-fingerprint-detector/dist/cli.js
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - audit-data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:8000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  postgres-data:
+  audit-data:

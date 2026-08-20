@@ -1,0 +1,10 @@
+.git
+.github
+.venv
+node_modules
+llm-fingerprint-detector/node_modules
+llm-fingerprint-detector/dist
+data
+reports
+__pycache__
+.pytest_cache
