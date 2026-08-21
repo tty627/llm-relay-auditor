@@ -299,6 +299,69 @@ async def test_collect_paper_profile_rejects_protocol_drift(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_collect_paper_profile_accepts_canonical_ordinary_invalid(tmp_path, monkeypatch):
+    cli_path = tmp_path / "cli.js"
+    cli_path.write_text("// fake", encoding="utf-8")
+    runner = FingerprintRunner(cli_path)
+
+    async def fake_execute(arguments, *, accepted_exit_codes, environment):
+        actual_output = Path(arguments[arguments.index("--out") + 1])
+        actual_samples = Path(arguments[arguments.index("--samples-out") + 1])
+        payload = write_paper_artifacts(actual_output, actual_samples)
+        lines = actual_samples.read_text(encoding="utf-8").splitlines()
+        first = json.loads(lines[0])
+        first.update(
+            {
+                "raw": "101",
+                "normalized": "101",
+                "normalizationCandidate": "101",
+                "category": "invalid",
+                "normalizationCategory": "invalid",
+                "excludedFromDistribution": False,
+                "exclusionReason": None,
+                "errorKind": None,
+            }
+        )
+        lines[0] = json.dumps(first, sort_keys=True, separators=(",", ":"))
+        evidence_text = "\n".join(lines) + "\n"
+        actual_samples.write_text(evidence_text, encoding="utf-8")
+        digest = hashlib.sha256(evidence_text.encode()).hexdigest()
+        cell = payload["fingerprint"]["cells"][first["cellId"]]
+        cell.update({"counts": {}, "validCount": 0, "invalidCount": 1})
+        quality = payload["fingerprint"]["quality"]
+        quality.update(
+            {
+                "validSamples": 39,
+                "invalidSamples": 1,
+                "rawEvidenceSha256": digest,
+            }
+        )
+        payload["collection"].update(
+            {
+                "validSamples": 39,
+                "invalidSamples": 1,
+                "rawEvidenceSha256": digest,
+            }
+        )
+        actual_output.write_text(json.dumps(payload["fingerprint"]), encoding="utf-8")
+        return payload
+
+    monkeypatch.setattr(runner, "_execute", fake_execute)
+    result = await runner.collect_paper_profile(
+        EndpointSpec(base_url="https://example.test/v1", model="paper-model"),
+        role="audit",
+        scheduler_seed="safe-seed",
+        output_path=tmp_path / "fingerprint.json",
+        samples_output_path=tmp_path / "samples.jsonl",
+        samples=1,
+        concurrency=2,
+    )
+
+    assert result["fingerprint"]["quality"]["invalidSamples"] == 1
+    assert result["collection"]["invalidSamples"] == 1
+
+
+@pytest.mark.asyncio
 async def test_collect_paper_profile_rebuilds_distribution_from_jsonl(tmp_path, monkeypatch):
     cli_path = tmp_path / "cli.js"
     cli_path.write_text("// fake", encoding="utf-8")

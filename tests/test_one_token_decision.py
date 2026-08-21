@@ -5,7 +5,13 @@ import math
 
 import pytest
 
-from relay_auditor.one_token_decision import build_safe_decision
+from relay_auditor.one_token_decision import (
+    _RawEvidenceValidationError,
+    _rebuild_raw_evidence,
+)
+from relay_auditor.one_token_decision import (
+    build_safe_decision as _build_safe_decision,
+)
 from relay_auditor.one_token_policy import (
     ComparisonScope,
     load_threshold_policy,
@@ -103,6 +109,20 @@ VALIDATED_POLICY_PAYLOAD = {
     },
 }
 VALIDATED_POLICY = load_threshold_policy(VALIDATED_POLICY_PAYLOAD)
+ELIGIBLE_REFERENCE.update(
+    {
+        "calibration_policy_id": VALIDATED_POLICY.id,
+        "calibration_policy_sha256": policy_sha256(VALIDATED_POLICY),
+    }
+)
+
+
+def build_safe_decision(*args, **kwargs):
+    if args and isinstance(args[0], DecisionPayload):
+        kwargs.setdefault("raw_evidence_jsonl", args[0].raw_evidence_jsonl)
+    return _build_safe_decision(*args, **kwargs)
+
+
 VALID_SCOPE = ComparisonScope.model_validate(
     {
         "methodProfileSha256": PROFILE_SHA,
@@ -120,6 +140,75 @@ VALID_SCOPE = ComparisonScope.model_validate(
         "qualityPassed": True,
     }
 )
+
+
+class DecisionPayload(dict):
+    raw_evidence_jsonl: dict[str, bytes]
+
+
+def _raw_sidecar(fingerprint: dict[str, object], *, role: str) -> bytes:
+    samples: list[dict[str, object]] = []
+    cells = fingerprint["cells"]
+    assert isinstance(cells, dict)
+    for cell_id in sorted(cells):
+        cell = cells[cell_id]
+        assert isinstance(cell, dict)
+        planned: list[tuple[str, str | None]] = []
+        counts = cell["counts"]
+        assert isinstance(counts, dict)
+        for normalized, count in sorted(counts.items()):
+            planned.extend([("valid", str(normalized))] * int(count))
+        planned.extend([("invalid", "out-of-range")] * int(cell["invalidCount"]))
+        for category in ("refusal", "empty", "error"):
+            planned.extend([(category, None)] * int(cell[f"{category}Count"]))
+        for repetition, (category, normalized) in enumerate(planned):
+            is_error = category == "error"
+            samples.append(
+                {
+                    "evidenceVersion": 1,
+                    "protocolId": fingerprint["protocol"],
+                    "role": role,
+                    "requestedModel": fingerprint["model"],
+                    "jobId": hashlib.sha256(f"{cell_id}\0{repetition}".encode()).hexdigest(),
+                    "cellId": cell_id,
+                    "repetitionIndex": repetition,
+                    "category": category,
+                    "normalized": normalized,
+                    "normalizationCandidate": normalized,
+                    "normalizationCategory": None if is_error else category,
+                    "excludedFromDistribution": is_error,
+                    "exclusionReason": None,
+                    "reasoningTraceFields": [],
+                    "reasoningTraceCharacterCount": 0,
+                    "usage": None if is_error else {"reasoningTokens": 0},
+                    "errorKind": "request_failed" if is_error else None,
+                }
+            )
+    return "".join(
+        f"{json.dumps(sample, sort_keys=True, separators=(',', ':'))}\n" for sample in samples
+    ).encode()
+
+
+def _attach_raw_sidecars(result: dict[str, object]) -> DecisionPayload:
+    target = result["target"]
+    assert isinstance(target, dict)
+    target_fingerprint = target["fingerprint"]
+    reference_fingerprint = result["reference"]
+    assert isinstance(target_fingerprint, dict)
+    assert isinstance(reference_fingerprint, dict)
+    raw = {
+        "target": _raw_sidecar(target_fingerprint, role="audit"),
+        "reference": _raw_sidecar(reference_fingerprint, role="enrollment"),
+    }
+    target_quality = target_fingerprint["quality"]
+    reference_quality = reference_fingerprint["quality"]
+    assert isinstance(target_quality, dict)
+    assert isinstance(reference_quality, dict)
+    target_quality["rawEvidenceSha256"] = hashlib.sha256(raw["target"]).hexdigest()
+    reference_quality["rawEvidenceSha256"] = hashlib.sha256(raw["reference"]).hexdigest()
+    attached = DecisionPayload(result)
+    attached.raw_evidence_jsonl = raw
+    return attached
 
 
 def payload(
@@ -190,7 +279,7 @@ def payload(
         }
 
     cell_jsd = JSD_BY_OTHER_COUNT[other_count]
-    return {
+    result: dict[str, object] = {
         "verdict": verdict,
         "comparison": {
             "meanJsd": mean_jsd,
@@ -214,6 +303,7 @@ def payload(
         "target": {"fingerprint": fingerprint("audit", "a" * 64, target=True)},
         "reference": fingerprint("enrollment", "b" * 64, target=False),
     }
+    return _attach_raw_sidecars(result)
 
 
 @pytest.mark.parametrize(
@@ -267,10 +357,14 @@ def test_validated_policy_accepts_online_verify_target_as_comparison_a() -> None
     target["quality"]["invalidSamples"] = 1  # type: ignore[index]
     # Node verify calls compare(target, reference), so A is the target here.
     sample["comparison"]["cells"][0].update({"validA": 9, "validB": 10})  # type: ignore[index]
+    sample = _attach_raw_sidecars(dict(sample))
 
     result = build_safe_decision(
         sample,
-        reference_metadata=ELIGIBLE_REFERENCE,
+        reference_metadata={
+            **ELIGIBLE_REFERENCE,
+            "calibration_policy_sha256": policy_sha256(policy),
+        },
         threshold_policy=policy,
         comparison_scope=scope,
     )
@@ -385,9 +479,8 @@ def test_all_incompatibility_reasons_are_preserved() -> None:
     result = build_safe_decision(
         sample,
         reference_metadata={
+            **ELIGIBLE_REFERENCE,
             "ground_truth": "relay_snapshot_not_official",
-            "decision_eligible": True,
-            "baseline_status": "active",
         },
         threshold_policy=VALIDATED_POLICY,
         comparison_scope=VALID_SCOPE,
@@ -411,9 +504,8 @@ def test_eligible_ground_truth_can_receive_calibrated_decision(ground_truth: str
     result = build_safe_decision(
         payload(),
         reference_metadata={
+            **ELIGIBLE_REFERENCE,
             "ground_truth": ground_truth,
-            "decision_eligible": True,
-            "baseline_status": "active",
         },
         threshold_policy=VALIDATED_POLICY,
         comparison_scope=VALID_SCOPE,
@@ -491,6 +583,12 @@ def test_validated_policy_reconstructs_actual_v2_evidence(
     ],
 )
 def test_validated_policy_requires_explicitly_eligible_active_reference(metadata) -> None:
+    metadata.update(
+        {
+            "calibration_policy_id": VALIDATED_POLICY.id,
+            "calibration_policy_sha256": policy_sha256(VALIDATED_POLICY),
+        }
+    )
     result = build_safe_decision(
         payload(),
         reference_metadata=metadata,
@@ -509,6 +607,8 @@ def test_validated_policy_requires_reference_ground_truth() -> None:
             "reference_name": "Official A",
             "decision_eligible": True,
             "baseline_status": "active",
+            "calibration_policy_id": VALIDATED_POLICY.id,
+            "calibration_policy_sha256": policy_sha256(VALIDATED_POLICY),
         },
         threshold_policy=VALIDATED_POLICY,
         comparison_scope=VALID_SCOPE,
@@ -518,13 +618,279 @@ def test_validated_policy_requires_reference_ground_truth() -> None:
     assert result["reasons"] == ["reference_ground_truth_missing"]
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "expected_reason"),
+    [
+        (
+            "calibration_policy_id",
+            "00000000-0000-0000-0000-000000000099",
+            "reference_calibration_policy_id_mismatch",
+        ),
+        (
+            "calibration_policy_sha256",
+            "f" * 64,
+            "reference_calibration_policy_sha256_mismatch",
+        ),
+    ],
+)
+def test_validated_policy_requires_exact_reference_policy_binding(
+    field: str,
+    value: str,
+    expected_reason: str,
+) -> None:
+    metadata = {**ELIGIBLE_REFERENCE, field: value}
+
+    result = build_safe_decision(
+        payload(),
+        reference_metadata=metadata,
+        threshold_policy=VALIDATED_POLICY,
+        comparison_scope=VALID_SCOPE,
+    )
+
+    assert result["status"] == "incompatible"
+    assert expected_reason in result["reasons"]
+    assert result["decisionEligible"] is False
+
+
+def _decision_with_target_raw(
+    sample: DecisionPayload,
+    raw_target: bytes,
+    *,
+    bind_hash: bool,
+) -> dict[str, object]:
+    if bind_hash:
+        target = sample["target"]
+        assert isinstance(target, dict)
+        fingerprint = target["fingerprint"]
+        assert isinstance(fingerprint, dict)
+        quality = fingerprint["quality"]
+        assert isinstance(quality, dict)
+        quality["rawEvidenceSha256"] = hashlib.sha256(raw_target).hexdigest()
+    raw = {**sample.raw_evidence_jsonl, "target": raw_target}
+    return _build_safe_decision(
+        sample,
+        reference_metadata=ELIGIBLE_REFERENCE,
+        threshold_policy=VALIDATED_POLICY,
+        comparison_scope=VALID_SCOPE,
+        raw_evidence_jsonl=raw,
+    )
+
+
+def _replace_first_raw_sample(raw_jsonl: bytes, **changes: object) -> bytes:
+    lines = raw_jsonl.splitlines()
+    first = json.loads(lines[0])
+    first.update(changes)
+    lines[0] = json.dumps(first, sort_keys=True, separators=(",", ":")).encode()
+    return b"\n".join(lines) + b"\n"
+
+
+def test_validated_policy_requires_actual_hash_bound_raw_sidecar_bytes() -> None:
+    sample = payload()
+    missing = _build_safe_decision(
+        sample,
+        reference_metadata=ELIGIBLE_REFERENCE,
+        threshold_policy=VALIDATED_POLICY,
+        comparison_scope=VALID_SCOPE,
+    )
+    assert "reference_raw_evidence_missing" in missing["reasons"]
+    assert "target_raw_evidence_missing" in missing["reasons"]
+
+    tampered = _decision_with_target_raw(
+        sample,
+        sample.raw_evidence_jsonl["target"] + b" ",
+        bind_hash=False,
+    )
+    assert "target_raw_evidence_hash_mismatch" in tampered["reasons"]
+    assert tampered["decisionEligible"] is False
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    [
+        (
+            lambda lines: [b"\xff" + lines[0][1:], *lines[1:]],
+            "target_raw_evidence_invalid_utf8",
+        ),
+        (
+            lambda lines: [b"!" + lines[0][1:], *lines[1:]],
+            "target_raw_evidence_invalid_json",
+        ),
+        (
+            lambda lines: [
+                lines[0].replace(
+                    b'"category":"valid"',
+                    b'"category":"valid","category":"valid"',
+                ),
+                *lines[1:],
+            ],
+            "target_raw_evidence_duplicate_json_key",
+        ),
+        (
+            lambda lines: [lines[0], lines[0], *lines[2:]],
+            "target_raw_evidence_duplicate_job",
+        ),
+        (
+            lambda lines: lines[:-1],
+            "target_raw_evidence_plan_mismatch",
+        ),
+    ],
+)
+def test_validated_policy_rejects_malformed_or_incomplete_raw_sidecars(
+    mutation,
+    expected_reason: str,
+) -> None:
+    sample = payload()
+    lines = sample.raw_evidence_jsonl["target"].splitlines()
+    mutated = b"\n".join(mutation(lines)) + b"\n"
+
+    result = _decision_with_target_raw(sample, mutated, bind_hash=True)
+
+    assert expected_reason in result["reasons"]
+    assert result["decisionEligible"] is False
+
+
+def test_validated_policy_rebuilds_sample_state_and_aggregates_from_raw_sidecar() -> None:
+    invalid_state = payload()
+    lines = invalid_state.raw_evidence_jsonl["target"].splitlines()
+    first = json.loads(lines[0])
+    first["excludedFromDistribution"] = True
+    lines[0] = json.dumps(first, sort_keys=True, separators=(",", ":")).encode()
+    invalid_result = _decision_with_target_raw(
+        invalid_state,
+        b"\n".join(lines) + b"\n",
+        bind_hash=True,
+    )
+    assert "target_raw_evidence_sample_state_invalid" in invalid_result["reasons"]
+
+    forged_cell = payload()
+    target = forged_cell["target"]
+    assert isinstance(target, dict)
+    fingerprint = target["fingerprint"]
+    assert isinstance(fingerprint, dict)
+    cells = fingerprint["cells"]
+    assert isinstance(cells, dict)
+    cell = cells["random-number-1-100:en"]
+    assert isinstance(cell, dict)
+    cell["counts"] = {"forged": 10}
+    forged_cell_result = build_safe_decision(
+        forged_cell,
+        reference_metadata=ELIGIBLE_REFERENCE,
+        threshold_policy=VALIDATED_POLICY,
+        comparison_scope=VALID_SCOPE,
+    )
+    assert "target_raw_evidence_cell_aggregate_mismatch" in forged_cell_result["reasons"]
+
+    forged_quality = payload()
+    target = forged_quality["target"]
+    assert isinstance(target, dict)
+    fingerprint = target["fingerprint"]
+    assert isinstance(fingerprint, dict)
+    quality = fingerprint["quality"]
+    assert isinstance(quality, dict)
+    quality["validSamples"] = 9
+    quality["invalidSamples"] = 1
+    forged_quality_result = build_safe_decision(
+        forged_quality,
+        reference_metadata=ELIGIBLE_REFERENCE,
+        threshold_policy=VALIDATED_POLICY,
+        comparison_scope=VALID_SCOPE,
+    )
+    assert "target_raw_evidence_quality_aggregate_mismatch" in forged_quality_result["reasons"]
+
+
+def test_raw_rebuilder_accepts_canonical_reasoning_invalid_and_contaminated_error() -> None:
+    sample = payload()
+    target = sample["target"]
+    assert isinstance(target, dict)
+    fingerprint = target["fingerprint"]
+    assert isinstance(fingerprint, dict)
+    ordinary = json.loads(sample.raw_evidence_jsonl["target"].splitlines()[0])
+
+    reasoning_invalid = _replace_first_raw_sample(
+        sample.raw_evidence_jsonl["target"],
+        category="invalid",
+        normalized=None,
+        normalizationCandidate=ordinary["normalized"],
+        normalizationCategory="valid",
+        excludedFromDistribution=True,
+        exclusionReason="reasoning_contamination",
+        reasoningTraceFields=["reasoning"],
+        reasoningTraceCharacterCount=4,
+        usage={"reasoningTokens": 1},
+        errorKind=None,
+    )
+    rebuilt = _rebuild_raw_evidence(
+        reasoning_invalid,
+        fingerprint=fingerprint,
+        expected_role="audit",
+        selected_cells={"random-number-1-100:en"},
+        samples_per_cell=10,
+    )
+    assert rebuilt["invalid"] == 1
+    assert rebuilt["reasoningTraceCount"] == 1
+
+    contaminated_error = _replace_first_raw_sample(
+        sample.raw_evidence_jsonl["target"],
+        category="error",
+        normalized=None,
+        normalizationCandidate=None,
+        normalizationCategory=None,
+        excludedFromDistribution=True,
+        exclusionReason="provider_error",
+        reasoningTraceFields=["reasoning"],
+        reasoningTraceCharacterCount=4,
+        usage={"reasoningTokens": 1},
+        errorKind="provider_error",
+    )
+    rebuilt = _rebuild_raw_evidence(
+        contaminated_error,
+        fingerprint=fingerprint,
+        expected_role="audit",
+        selected_cells={"random-number-1-100:en"},
+        samples_per_cell=10,
+    )
+    assert rebuilt["error"] == 1
+    assert rebuilt["directness"] == "violated"
+
+
+@pytest.mark.parametrize("category", ["valid", "refusal", "empty"])
+def test_raw_rebuilder_rejects_contaminated_noninvalid_success_states(category: str) -> None:
+    sample = payload()
+    target = sample["target"]
+    assert isinstance(target, dict)
+    fingerprint = target["fingerprint"]
+    assert isinstance(fingerprint, dict)
+    normalized = "7" if category == "valid" else None
+    contaminated = _replace_first_raw_sample(
+        sample.raw_evidence_jsonl["target"],
+        category=category,
+        normalized=normalized,
+        normalizationCandidate=normalized,
+        normalizationCategory=category,
+        excludedFromDistribution=False,
+        exclusionReason=None,
+        reasoningTraceFields=["reasoning"],
+        reasoningTraceCharacterCount=4,
+        usage={"reasoningTokens": 1},
+        errorKind=None,
+    )
+
+    with pytest.raises(_RawEvidenceValidationError, match="sample_state_invalid"):
+        _rebuild_raw_evidence(
+            contaminated,
+            fingerprint=fingerprint,
+            expected_role="audit",
+            selected_cells={"random-number-1-100:en"},
+            samples_per_cell=10,
+        )
+
+
 def test_noneligible_ground_truth_is_incompatible() -> None:
     result = build_safe_decision(
         payload(),
         reference_metadata={
+            **ELIGIBLE_REFERENCE,
             "ground_truth": "relay_snapshot_not_official",
-            "decision_eligible": True,
-            "baseline_status": "active",
         },
         threshold_policy=VALIDATED_POLICY,
         comparison_scope=VALID_SCOPE,
@@ -538,9 +904,8 @@ def test_explicitly_ineligible_reference_is_incompatible() -> None:
     result = build_safe_decision(
         payload(),
         reference_metadata={
-            "ground_truth": "official_first_party",
+            **ELIGIBLE_REFERENCE,
             "decision_eligible": False,
-            "baseline_status": "active",
         },
         threshold_policy=VALIDATED_POLICY,
         comparison_scope=VALID_SCOPE,
@@ -557,8 +922,7 @@ def test_nonactive_reference_baseline_is_incompatible(baseline_status: str) -> N
     result = build_safe_decision(
         payload(),
         reference_metadata={
-            "ground_truth": "official_first_party",
-            "decision_eligible": True,
+            **ELIGIBLE_REFERENCE,
             "baseline_status": baseline_status,
         },
         threshold_policy=VALIDATED_POLICY,

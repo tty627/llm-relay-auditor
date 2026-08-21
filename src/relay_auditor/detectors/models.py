@@ -1,3 +1,4 @@
+import unicodedata
 from typing import Any
 
 import httpx
@@ -9,6 +10,7 @@ async def discover_models(
     endpoint: EphemeralConnectionSpec,
     *,
     timeout_seconds: float,
+    transport: httpx.AsyncBaseTransport | None = None,
 ) -> dict[str, Any]:
     headers = {"accept": "application/json"}
     api_key = endpoint.reveal_api_key()
@@ -16,7 +18,11 @@ async def discover_models(
         headers["authorization"] = f"Bearer {api_key}"
 
     url = f"{str(endpoint.base_url).rstrip('/')}/models"
-    async with httpx.AsyncClient(timeout=timeout_seconds, follow_redirects=False) as client:
+    async with httpx.AsyncClient(
+        timeout=timeout_seconds,
+        follow_redirects=False,
+        transport=transport,
+    ) as client:
         response = await client.get(url, headers=headers)
     response.raise_for_status()
     payload = response.json()
@@ -33,8 +39,20 @@ async def discover_models(
         if not isinstance(model_id, str) or not model_id.strip() or model_id in seen:
             continue
         model_id = model_id.strip()
-        seen.add(model_id)
         owner = item.get("owned_by")
+        if api_key:
+            normalized_key = unicodedata.normalize("NFC", api_key).casefold()
+            untrusted_strings = [model_id]
+            if isinstance(owner, str):
+                untrusted_strings.append(owner)
+            if any(
+                normalized_key in unicodedata.normalize("NFC", value).casefold()
+                for value in untrusted_strings
+            ):
+                raise ValueError(
+                    "endpoint /models response contained a possible credential echo"
+                )
+        seen.add(model_id)
         models.append(
             {
                 "id": model_id,

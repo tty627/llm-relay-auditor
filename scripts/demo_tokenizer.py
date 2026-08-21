@@ -50,7 +50,8 @@ def verify(
         json.dumps(
             {
                 "model": model,
-                "verdict": result["verdict"],
+                "operational_verdict": result["verdict"],
+                "exploratory_verdict": comparison["exploratory_verdict"],
                 "normalized_l1": comparison["normalized_l1"],
                 "unstable_probes": comparison["target_unstable_probes"],
             },
@@ -89,15 +90,19 @@ def main() -> int:
         substitute = verify(client, "substitute-model", reference_id)
         mixed = verify(client, "mixed-20", reference_id)
 
+    same_comparison = same["result"]["comparison"]
+    substitute_comparison = substitute["result"]["comparison"]
+    mixed_comparison = mixed["result"]["comparison"]
     expected = (
-        same["verdict"] == "match"
-        and substitute["verdict"] == "mismatch"
-        and mixed["verdict"] in {"unstable", "mismatch"}
+        all(result["verdict"] == "unverifiable" for result in (same, substitute, mixed))
+        and same_comparison["exploratory_verdict"] == "match"
+        and substitute_comparison["exploratory_verdict"] == "mismatch"
+        and mixed_comparison["exploratory_verdict"] in {"unstable", "mismatch"}
     )
     if not expected:
         print("Tokenizer 演示判定未达到预期", file=sys.stderr)
         return 1
-    print("Tokenizer 闭环通过：同模型=MATCH，替换=MISMATCH，混合路由=已识别")
+    print("Tokenizer 闭环通过：operational=UNVERIFIABLE，探索性距离按预期区分场景")
     return 0
 
 
