@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>对比记录 · Relay Model Auditor</title>
+    <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/assets/styles.css">
+    <script src="/assets/status.js" defer></script>
+    <script src="/assets/history.js" defer></script>
+  </head>
+  <body>
+    <div class="page-shell history-shell">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="Relay Model Auditor 首页">
+          <span class="brand-mark" aria-hidden="true">RA</span>
+          <span>
+            <strong>Relay Model Auditor</strong>
+            <small>本机对比记录与证据索引</small>
+          </span>
+        </a>
+        <div class="topbar-actions">
+          <span class="status-pill"><i></i> SQLite + JSON</span>
+          <a class="text-link" href="/">返回工作台</a>
+        </div>
+      </header>
+
+      <main>
+        <section class="history-hero archive-hero">
+          <div>
+            <p class="eyebrow">LOCAL COMPARISON ARCHIVE</p>
+            <h1>对比记录</h1>
+            <p>先看批次是否真的发出并收到响应，再看结论与证据。API Key 不会进入记录。</p>
+          </div>
+        </section>
+
+        <section id="history-summary" class="archive-stats" aria-live="polite">
+          <article><span>全部记录</span><strong id="summary-total">—</strong></article>
+          <article><span>本页成功</span><strong id="summary-success">—</strong></article>
+          <article><span>本页失败 / 中断</span><strong id="summary-failed">—</strong></article>
+          <article><span>本页等待重试</span><strong id="summary-waiting">—</strong></article>
+          <article><span>本页计划需调整</span><strong id="summary-blocked">—</strong></article>
+          <article><span>本页已取消</span><strong id="summary-canceled">—</strong></article>
+          <article><span>本页排队 / 未执行</span><strong id="summary-queued">—</strong></article>
+          <article><span>本页运行 / 暂停</span><strong id="summary-active">—</strong></article>
+        </section>
+
+        <section class="panel history-filters-panel">
+          <form id="history-filters" class="history-filters">
+            <label>
+              <span>中转站</span>
+              <input id="filter-station" placeholder="名称关键词">
+            </label>
+            <label>
+              <span>模型</span>
+              <input id="filter-model" placeholder="model-id" spellcheck="false">
+            </label>
+            <label>
+              <span>结论</span>
+              <select id="filter-verdict">
+                <option value="">全部</option>
+                <option value="match">较一致</option>
+                <option value="uncertain">不确定</option>
+                <option value="mismatch">明显不一致</option>
+                <option value="insufficient">证据不足</option>
+                <option value="unverifiable">不可验证</option>
+                <option value="error">执行失败</option>
+                <option value="running">执行中</option>
+                <option value="paused">已暂停</option>
+                <option value="canceled">已取消</option>
+                <option value="interrupted">服务重启中断</option>
+              </select>
+            </label>
+            <div class="history-filter-actions">
+              <button class="button button-primary" type="submit">筛选</button>
+              <button id="clear-filters" class="button button-ghost" type="button">清空</button>
+            </div>
+          </form>
+        </section>
+
+        <div id="history-error" class="reference-summary error-text hidden" role="alert"></div>
+        <div id="history-empty" class="panel empty-state hidden">
+          <div class="empty-orbit" aria-hidden="true"><i></i></div>
+          <strong>没有符合条件的对比记录</strong>
+          <p>返回工作台完成一次模型对比后，记录会自动出现在这里。</p>
+        </div>
+        <div id="history-groups" class="history-groups"></div>
+
+        <nav class="history-pagination" aria-label="历史记录分页">
+          <button id="previous-page" class="button button-ghost" type="button">上一页</button>
+          <span id="page-status">—</span>
+          <button id="next-page" class="button button-ghost" type="button">下一页</button>
+        </nav>
+      </main>
+
+      <footer>
+        <p>历史摘要来自本机 SQLite；完整统计过程仍以 JSON Artifact 为准。</p>
+        <p id="history-health">正在连接本地服务…</p>
+      </footer>
+    </div>
+  </body>
+</html>

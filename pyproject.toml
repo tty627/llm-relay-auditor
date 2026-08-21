@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "relay-model-auditor"
-version = "0.1.0"
+version = "0.2.0"
 description = "面向大模型中转站的黑盒模型验真与质量审计服务"
 readme = "README.md"
 requires-python = ">=3.11"

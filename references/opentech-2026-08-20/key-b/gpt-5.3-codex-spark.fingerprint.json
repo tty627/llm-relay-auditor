@@ -1,0 +1,101 @@
+{
+  "formatVersion": 1,
+  "protocol": "one-token/v1",
+  "model": "gpt-5.3-codex-spark",
+  "collectedAt": "2026-08-20T04:07:11.010Z",
+  "samplesPerCell": 15,
+  "postReasoning": false,
+  "cells": {
+    "random-number-1-100:en": {
+      "cellId": "random-number-1-100:en",
+      "counts": {
+        "37": 1,
+        "42": 3,
+        "47": 2,
+        "57": 3,
+        "73": 5,
+        "74": 1
+      },
+      "validCount": 15,
+      "invalidCount": 0,
+      "refusalCount": 0,
+      "emptyCount": 0,
+      "errorCount": 0,
+      "totalCount": 15,
+      "entropyBits": 2.365596230357602,
+      "normalizedEntropy": 0.3560577114836396,
+      "medianLatencyMs": 1845.210667000003,
+      "meanCompletionTokens": 141.66666666666666,
+      "meanReasoningTokens": 134.66666666666666
+    },
+    "random-number-1-100:zh": {
+      "cellId": "random-number-1-100:zh",
+      "counts": {
+        "37": 1,
+        "42": 1,
+        "47": 2,
+        "57": 5,
+        "58": 2,
+        "73": 3,
+        "83": 1
+      },
+      "validCount": 15,
+      "invalidCount": 0,
+      "refusalCount": 0,
+      "emptyCount": 0,
+      "errorCount": 0,
+      "totalCount": 15,
+      "entropyBits": 2.5492553971685,
+      "normalizedEntropy": 0.3837011705780071,
+      "medianLatencyMs": 2195.5747910000064,
+      "meanCompletionTokens": 185.4,
+      "meanReasoningTokens": 178.4
+    },
+    "random-color:en": {
+      "cellId": "random-color:en",
+      "counts": {
+        "teal": 7,
+        "blue": 5,
+        "azure": 1,
+        "emerald": 1,
+        "chartreuse": 1
+      },
+      "validCount": 15,
+      "invalidCount": 0,
+      "refusalCount": 0,
+      "emptyCount": 0,
+      "errorCount": 0,
+      "totalCount": 15,
+      "entropyBits": 1.822815600352516,
+      "normalizedEntropy": 0.3714807911111503,
+      "medianLatencyMs": 2195.7192919999998,
+      "meanCompletionTokens": 106.86666666666666,
+      "meanReasoningTokens": 99.26666666666667
+    },
+    "random-animal:en": {
+      "cellId": "random-animal:en",
+      "counts": {
+        "otter": 10,
+        "narwhal": 1,
+        "axolotl": 1,
+        "dolphin": 1,
+        "kangaroo": 1,
+        "platypus": 1
+      },
+      "validCount": 15,
+      "invalidCount": 0,
+      "refusalCount": 0,
+      "emptyCount": 0,
+      "errorCount": 0,
+      "totalCount": 15,
+      "entropyBits": 1.6922718656836107,
+      "normalizedEntropy": 0.2998431938697499,
+      "medianLatencyMs": 1738.8320829999975,
+      "meanCompletionTokens": 107.73333333333333,
+      "meanReasoningTokens": 99.46666666666667
+    }
+  },
+  "meta": {
+    "tool": "llm-fingerprint-detector"
+  }
+}
