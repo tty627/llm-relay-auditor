@@ -1,13 +1,15 @@
 import hashlib
+import hmac
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import urlparse
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response, Security
 from fastapi.responses import FileResponse
+from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import IntegrityError
 
@@ -20,6 +22,7 @@ from relay_auditor.detectors.fingerprint import (
     safeguard_verification_result,
 )
 from relay_auditor.detectors.models import discover_models
+from relay_auditor.detectors.preflight import normalize_fingerprint_base_url
 from relay_auditor.detectors.smoke import run_smoke
 from relay_auditor.detectors.tokenizer import (
     collect_tokenizer_fingerprint,
@@ -36,6 +39,8 @@ from relay_auditor.schemas import (
     ConsoleModelDiscoveryRequest,
     ConsoleReferenceCollectRequest,
     ConsoleReferenceCollectResponse,
+    EndpointSpec,
+    EphemeralConnectionSpec,
     FingerprintCollectRequest,
     FingerprintVerifyRequest,
     ManagedEndpointCreateRequest,
@@ -47,6 +52,7 @@ from relay_auditor.schemas import (
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     configured = settings or Settings()
+    configured.validate_managed_credential_configuration()
     database = Database(configured.database_url)
     evidence = EvidenceStore(configured.evidence_dir)
     fingerprint = FingerprintRunner(configured.fingerprint_cli_path)
@@ -74,11 +80,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.fingerprint = fingerprint
     app.state.batches = batches
     app.include_router(mock_router)
+    management_token_header = APIKeyHeader(
+        name="X-Relay-Auditor-Token",
+        scheme_name="ManagedCredentialToken",
+        description="Local management token required when api_key_env is used.",
+        auto_error=False,
+    )
 
     @app.middleware("http")
     async def disable_console_api_caching(request: Request, call_next):
         response = await call_next(request)
-        if request.url.path.startswith("/api/v1/console/"):
+        if request.url.path.startswith("/api/v1/console/") or request.headers.get(
+            "x-relay-auditor-token"
+        ) is not None:
             response.headers["Cache-Control"] = "no-store"
         return response
 
@@ -96,6 +110,56 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "Referrer-Policy": "no-referrer",
             "X-Content-Type-Options": "nosniff",
         }
+
+    def redact_error(error: Exception, api_key: str | None) -> str:
+        detail = str(error)
+        if api_key:
+            detail = detail.replace(api_key, "[REDACTED]")
+        return detail
+
+    def require_management_token(presented: str | None) -> None:
+        expected = configured.management_token_value()
+        if expected is None:
+            raise HTTPException(
+                status_code=503,
+                detail="managed credential access is not configured",
+            )
+        valid = presented is not None and hmac.compare_digest(
+            presented.encode("utf-8"),
+            expected.encode("ascii"),
+        )
+        if not valid:
+            raise HTTPException(
+                status_code=401,
+                detail="valid X-Relay-Auditor-Token header required",
+            )
+
+    def resolve_managed_api_key(endpoint: Any, presented_token: str | None) -> str | None:
+        """Resolve only explicitly allowed credentials bound to this endpoint tuple."""
+
+        try:
+            if endpoint.api_key_env is None:
+                return None
+            require_management_token(presented_token)
+            configured.require_api_key_base_url_binding(
+                endpoint.api_key_env,
+                str(endpoint.base_url),
+            )
+            normalized_base_url = normalize_fingerprint_base_url(str(endpoint.base_url))
+            bound = any(
+                managed.enabled
+                and managed.api_key_env == endpoint.api_key_env
+                and managed.model == endpoint.model
+                and normalize_fingerprint_base_url(managed.base_url) == normalized_base_url
+                for managed in database.list_endpoints()
+            )
+            if not bound:
+                raise ValueError(
+                    "api_key_env is not bound to this base_url and model in the endpoint registry"
+                )
+            return configured.resolve_api_key(endpoint.api_key_env)
+        except (ValueError, RuntimeError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.get("/", include_in_schema=False)
     async def console() -> FileResponse:
@@ -118,17 +182,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"items": [run.as_dict() for run in database.list_runs(safe_limit)]}
 
     @app.post("/api/v1/endpoints", status_code=201)
-    async def create_endpoint(payload: ManagedEndpointCreateRequest) -> dict[str, object]:
+    async def create_endpoint(
+        payload: ManagedEndpointCreateRequest,
+        management_token: Annotated[str | None, Security(management_token_header)],
+    ) -> dict[str, object]:
+        if payload.api_key_env is not None:
+            require_management_token(management_token)
         try:
+            configured.require_api_key_base_url_binding(
+                payload.api_key_env,
+                str(payload.base_url),
+            )
             endpoint = database.create_endpoint(
                 endpoint_id=str(uuid4()),
                 name=payload.name,
                 provider=payload.provider,
-                base_url=str(payload.base_url),
+                base_url=normalize_fingerprint_base_url(str(payload.base_url)),
                 model=payload.model,
                 protocol=payload.protocol,
                 api_key_env=payload.api_key_env,
             )
+        except (ValueError, RuntimeError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
         except IntegrityError as error:
             raise HTTPException(status_code=409, detail="endpoint name already exists") from error
         return endpoint.as_dict()
@@ -136,6 +211,42 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/v1/endpoints")
     async def list_endpoints() -> dict[str, object]:
         return {"items": [endpoint.as_dict() for endpoint in database.list_endpoints()]}
+
+    @app.post("/api/v1/endpoints/{endpoint_id}/models")
+    async def discover_managed_endpoint_models(
+        endpoint_id: str,
+        response: Response,
+        management_token: Annotated[str | None, Security(management_token_header)],
+    ) -> dict[str, Any]:
+        """Discover models without accepting a plaintext credential in the request."""
+
+        response.headers["Cache-Control"] = "no-store"
+        managed = database.get_endpoint(endpoint_id)
+        if managed is None:
+            raise HTTPException(status_code=404, detail="managed endpoint not found")
+        if not managed.enabled:
+            raise HTTPException(status_code=409, detail="managed endpoint is disabled")
+        endpoint = EndpointSpec(
+            base_url=managed.base_url,
+            model=managed.model,
+            api_key_env=managed.api_key_env,
+        )
+        api_key = resolve_managed_api_key(endpoint, management_token)
+        try:
+            result = await discover_models(
+                EphemeralConnectionSpec(base_url=managed.base_url),
+                timeout_seconds=configured.request_timeout_seconds,
+                api_key=api_key,
+            )
+        except Exception as error:
+            detail = redact_error(error, api_key)
+            raise HTTPException(status_code=502, detail=detail) from error
+        return {
+            **result,
+            "endpoint_id": managed.id,
+            "registered_model": managed.model,
+            "credential_source": "env_ref" if managed.api_key_env else "none",
+        }
 
     @app.post("/api/v1/baselines", status_code=201)
     async def create_baseline(payload: BaselineCreateRequest) -> dict[str, object]:
@@ -151,9 +262,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }[payload.detector]
         if run.detector != expected_detector:
             raise HTTPException(status_code=409, detail="artifact detector does not match baseline")
-        if run.model != endpoint.model or run.target_base_url.rstrip(
-            "/"
-        ) != endpoint.base_url.rstrip("/"):
+        if run.model != endpoint.model or normalize_fingerprint_base_url(
+            run.target_base_url
+        ) != normalize_fingerprint_base_url(endpoint.base_url):
             raise HTTPException(status_code=409, detail="artifact endpoint does not match baseline")
         if not run.artifact_path or not Path(run.artifact_path).is_file():
             raise HTTPException(status_code=409, detail="artifact evidence file is missing")
@@ -174,12 +285,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"items": [baseline.as_dict() for baseline in database.list_baselines(endpoint_id)]}
 
     @app.post("/api/v1/audits/smoke", response_model=AuditResponse)
-    async def smoke_audit(payload: SmokeAuditRequest) -> AuditResponse:
+    async def smoke_audit(
+        payload: SmokeAuditRequest,
+        management_token: Annotated[str | None, Security(management_token_header)],
+    ) -> AuditResponse:
+        api_key = resolve_managed_api_key(payload.target, management_token)
         audit_id = str(uuid4())
         database.create_run(
             audit_id=audit_id,
             detector="smoke",
-            target_base_url=str(payload.target.base_url),
+            target_base_url=normalize_fingerprint_base_url(str(payload.target.base_url)),
             model=payload.target.model,
         )
         try:
@@ -187,6 +302,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 payload.target,
                 payload.prompt,
                 timeout_seconds=configured.request_timeout_seconds,
+                api_key=api_key,
             )
             artifact = evidence.write_json("smoke", audit_id, result)
             database.finish_run(
@@ -206,21 +322,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 result=result,
             )
         except Exception as error:
+            detail = redact_error(error, api_key)
             database.finish_run(
                 audit_id,
                 status="failed",
                 verdict="error",
-                error_message=str(error),
+                error_message=detail,
             )
-            raise HTTPException(status_code=502, detail=str(error)) from error
+            raise HTTPException(status_code=502, detail=detail) from error
 
     @app.post("/api/v1/fingerprints/collect", response_model=AuditResponse)
-    async def collect_fingerprint(payload: FingerprintCollectRequest) -> AuditResponse:
+    async def collect_fingerprint(
+        payload: FingerprintCollectRequest,
+        management_token: Annotated[str | None, Security(management_token_header)],
+    ) -> AuditResponse:
+        api_key = resolve_managed_api_key(payload.endpoint, management_token)
         audit_id = str(uuid4())
         database.create_run(
             audit_id=audit_id,
             detector="one_token_collect",
-            target_base_url=str(payload.endpoint.base_url),
+            target_base_url=normalize_fingerprint_base_url(str(payload.endpoint.base_url)),
             model=payload.endpoint.model,
         )
         output_path = evidence.fingerprint_path(audit_id)
@@ -231,6 +352,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 cells=payload.cells,
                 samples=payload.samples,
                 concurrency=payload.concurrency,
+                api_key=api_key,
             )
             digest = evidence.digest_file(output_path)
             database.finish_run(
@@ -250,22 +372,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 result=result,
             )
         except Exception as error:
+            detail = redact_error(error, api_key)
             database.finish_run(
                 audit_id,
                 status="failed",
                 verdict="error",
-                error_message=str(error),
+                error_message=detail,
             )
-            raise HTTPException(status_code=502, detail=str(error)) from error
+            raise HTTPException(status_code=502, detail=detail) from error
 
     @app.post("/api/v1/fingerprints/verify", response_model=AuditResponse)
-    async def verify_fingerprint(payload: FingerprintVerifyRequest) -> AuditResponse:
+    async def verify_fingerprint(
+        payload: FingerprintVerifyRequest,
+        management_token: Annotated[str | None, Security(management_token_header)],
+    ) -> AuditResponse:
+        api_key = resolve_managed_api_key(payload.endpoint, management_token)
         audit_id = str(uuid4())
         target_path: Path | None = None
         database.create_run(
             audit_id=audit_id,
             detector="one_token_verify",
-            target_base_url=str(payload.endpoint.base_url),
+            target_base_url=normalize_fingerprint_base_url(str(payload.endpoint.base_url)),
             model=payload.endpoint.model,
         )
         try:
@@ -282,6 +409,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 cells=payload.cells,
                 samples=payload.samples,
                 concurrency=payload.concurrency,
+                api_key=api_key,
             )
             verdict, result = safeguard_verification_result(
                 verdict,
@@ -306,14 +434,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 result=result,
             )
         except FileNotFoundError as error:
+            detail = redact_error(error, api_key)
             database.finish_run(
                 audit_id,
                 status="failed",
                 verdict="error",
-                error_message=str(error),
+                error_message=detail,
             )
-            raise HTTPException(status_code=404, detail=str(error)) from error
+            raise HTTPException(status_code=404, detail=detail) from error
         except Exception as error:
+            detail = redact_error(error, api_key)
             partial_path = str(target_path) if target_path and target_path.is_file() else None
             partial_sha = (
                 evidence.digest_file(target_path) if partial_path and target_path else None
@@ -324,15 +454,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 verdict="error",
                 artifact_path=partial_path,
                 artifact_sha256=partial_sha,
-                error_message=str(error),
+                error_message=detail,
             )
-            raise HTTPException(status_code=502, detail=str(error)) from error
-
-    def redact_error(error: Exception, api_key: str | None) -> str:
-        detail = str(error)
-        if api_key:
-            detail = detail.replace(api_key, "[REDACTED]")
-        return detail
+            raise HTTPException(status_code=502, detail=detail) from error
 
     def read_comparison_result(run: Any) -> dict[str, Any] | None:
         if not run.artifact_path:
@@ -762,7 +886,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         database.create_run(
             audit_id=audit_id,
             detector="one_token_collect",
-            target_base_url=str(endpoint.base_url),
+            target_base_url=normalize_fingerprint_base_url(str(endpoint.base_url)),
             model=endpoint.model,
         )
         output_path = evidence.fingerprint_path(audit_id)
@@ -874,7 +998,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         database.create_run(
             audit_id=audit_id,
             detector="one_token_verify",
-            target_base_url=str(endpoint.base_url),
+            target_base_url=normalize_fingerprint_base_url(str(endpoint.base_url)),
             model=endpoint.model,
         )
         try:
@@ -962,12 +1086,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=502, detail=detail) from error
 
     @app.post("/api/v1/tokenizers/collect", response_model=AuditResponse)
-    async def collect_tokenizer(payload: TokenizerCollectRequest) -> AuditResponse:
+    async def collect_tokenizer(
+        payload: TokenizerCollectRequest,
+        management_token: Annotated[str | None, Security(management_token_header)],
+    ) -> AuditResponse:
+        api_key = resolve_managed_api_key(payload.endpoint, management_token)
         audit_id = str(uuid4())
         database.create_run(
             audit_id=audit_id,
             detector="tokenizer_collect",
-            target_base_url=str(payload.endpoint.base_url),
+            target_base_url=normalize_fingerprint_base_url(str(payload.endpoint.base_url)),
             model=payload.endpoint.model,
         )
         try:
@@ -976,6 +1104,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 timeout_seconds=configured.request_timeout_seconds,
                 samples_per_point=payload.samples_per_point,
                 concurrency=payload.concurrency,
+                api_key=api_key,
             )
             artifact = evidence.write_json("tokenizers", audit_id, result)
             database.finish_run(
@@ -995,21 +1124,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 result=result,
             )
         except Exception as error:
+            detail = redact_error(error, api_key)
             database.finish_run(
                 audit_id,
                 status="failed",
                 verdict="error",
-                error_message=str(error),
+                error_message=detail,
             )
-            raise HTTPException(status_code=502, detail=str(error)) from error
+            raise HTTPException(status_code=502, detail=detail) from error
 
     @app.post("/api/v1/tokenizers/verify", response_model=AuditResponse)
-    async def verify_tokenizer(payload: TokenizerVerifyRequest) -> AuditResponse:
+    async def verify_tokenizer(
+        payload: TokenizerVerifyRequest,
+        management_token: Annotated[str | None, Security(management_token_header)],
+    ) -> AuditResponse:
+        api_key = resolve_managed_api_key(payload.endpoint, management_token)
         audit_id = str(uuid4())
         database.create_run(
             audit_id=audit_id,
             detector="tokenizer_verify",
-            target_base_url=str(payload.endpoint.base_url),
+            target_base_url=normalize_fingerprint_base_url(str(payload.endpoint.base_url)),
             model=payload.endpoint.model,
         )
         try:
@@ -1023,6 +1157,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 timeout_seconds=configured.request_timeout_seconds,
                 samples_per_point=payload.samples_per_point,
                 concurrency=payload.concurrency,
+                api_key=api_key,
             )
             comparison = compare_tokenizer_fingerprints(reference, target)
             result = {"reference_artifact_id": payload.reference_artifact_id, "target": target}
@@ -1046,21 +1181,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 result=result,
             )
         except FileNotFoundError as error:
+            detail = redact_error(error, api_key)
             database.finish_run(
                 audit_id,
                 status="failed",
                 verdict="error",
-                error_message=str(error),
+                error_message=detail,
             )
-            raise HTTPException(status_code=404, detail=str(error)) from error
+            raise HTTPException(status_code=404, detail=detail) from error
         except Exception as error:
+            detail = redact_error(error, api_key)
             database.finish_run(
                 audit_id,
                 status="failed",
                 verdict="error",
-                error_message=str(error),
+                error_message=detail,
             )
-            raise HTTPException(status_code=502, detail=str(error)) from error
+            raise HTTPException(status_code=502, detail=detail) from error
 
     return app
 

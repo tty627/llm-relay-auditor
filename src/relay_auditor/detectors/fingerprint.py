@@ -13,6 +13,7 @@ from uuid import uuid4
 from relay_auditor.one_token_decision import build_safe_decision
 from relay_auditor.one_token_policy import ComparisonScope, ThresholdPolicy
 from relay_auditor.schemas import EndpointSpec
+from relay_auditor.secret_safety import reject_secret_artifact
 
 _PAPER_PROTOCOL = "bruckner-2026-canonical40/v1"
 _PAPER_CELL_COUNT = 40
@@ -121,7 +122,6 @@ _PAPER_COLLECTION_KEYS = {
     "splitHalfComparableCells",
     "rawEvidenceSha256",
 }
-_DEFAULT_CLI_KEY_ENV_VARS = {"LLM_FINGERPRINT_API_KEY", "OPENAI_API_KEY"}
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 _PROTOCOL_CELL_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}:[a-z][a-z0-9-]{0,31}$")
@@ -293,7 +293,7 @@ class FingerprintRunner:
         concurrency: int,
         api_key: str | None = None,
     ) -> dict[str, Any]:
-        arguments, environment = self._base_arguments(
+        arguments, environment, credential = self._base_arguments(
             endpoint,
             cells,
             samples,
@@ -301,11 +301,35 @@ class FingerprintRunner:
             api_key=api_key,
         )
         arguments.extend(["fingerprint", "--out", str(output_path), "--json", "--quiet"])
-        return await self._execute(
-            arguments,
-            accepted_exit_codes={0},
-            environment=environment,
+        try:
+            payload = await self._execute(
+                arguments,
+                accepted_exit_codes={0},
+                environment=environment,
+            )
+        except asyncio.CancelledError:
+            reject_secret_artifact(
+                None,
+                credential,
+                paths=(output_path,),
+                source="partial One Token fingerprint",
+            )
+            raise
+        except Exception:
+            reject_secret_artifact(
+                None,
+                credential,
+                paths=(output_path,),
+                source="partial One Token fingerprint",
+            )
+            raise
+        reject_secret_artifact(
+            payload,
+            credential,
+            paths=(output_path,),
+            source="One Token fingerprint collection",
         )
+        return payload
 
     async def collect_paper_profile(
         self,
@@ -360,7 +384,6 @@ class FingerprintRunner:
         credential_arguments, environment, credential = self._credential_arguments(
             endpoint,
             api_key=api_key,
-            suppress_cli_default_keys=True,
         )
         arguments = [
             "node",
@@ -489,7 +512,7 @@ class FingerprintRunner:
         request_timeout_ms: int | None = None,
         idle_timeout_seconds: float | None = None,
     ) -> tuple[str, dict[str, Any]]:
-        arguments, environment = self._base_arguments(
+        arguments, environment, credential = self._base_arguments(
             endpoint,
             cells,
             samples,
@@ -527,6 +550,12 @@ class FingerprintRunner:
                     idle_timeout_seconds=idle_timeout_seconds,
                 )
         except FingerprintPausedError as error:
+            reject_secret_artifact(
+                None,
+                credential,
+                paths=(output_path,),
+                source="partial One Token fingerprint",
+            )
             summary = self.mark_partial_artifact(
                 output_path,
                 incomplete_reason="execution_interrupted",
@@ -534,12 +563,24 @@ class FingerprintRunner:
             error.partial_artifact = summary
             raise
         except asyncio.CancelledError:
+            reject_secret_artifact(
+                None,
+                credential,
+                paths=(output_path,),
+                source="partial One Token fingerprint",
+            )
             self.mark_partial_artifact(
                 output_path,
                 incomplete_reason="execution_interrupted",
             )
             raise
         except FingerprintStalledError as error:
+            reject_secret_artifact(
+                None,
+                credential,
+                paths=(output_path,),
+                source="partial One Token fingerprint",
+            )
             summary = self.mark_partial_artifact(
                 output_path,
                 incomplete_reason="progress_timeout",
@@ -547,18 +588,45 @@ class FingerprintRunner:
             error.partial_artifact = summary
             raise
         except InvalidCliJsonError as error:
+            reject_secret_artifact(
+                None,
+                credential,
+                paths=(output_path,),
+                source="One Token fingerprint recovery",
+            )
             try:
-                return await self._recover_verify(
+                recovered_verdict, recovered_payload = await self._recover_verify(
                     reference_path=reference_path,
                     target_path=output_path,
                     recovery_reason="invalid_verify_stdout_json",
                     cli_stdout_diagnostic=error.safe_diagnostic,
                 )
+                reject_secret_artifact(
+                    recovered_payload,
+                    credential,
+                    paths=(output_path,),
+                    source="One Token fingerprint recovery",
+                )
+                return recovered_verdict, recovered_payload
             except Exception as recovery_error:
                 raise RuntimeError(
                     f"{error} Offline recovery from the saved target fingerprint failed: "
                     f"{recovery_error}"
                 ) from error
+        except Exception:
+            reject_secret_artifact(
+                None,
+                credential,
+                paths=(output_path,),
+                source="partial One Token fingerprint",
+            )
+            raise
+        reject_secret_artifact(
+            payload,
+            credential,
+            paths=(output_path,),
+            source="One Token fingerprint verification",
+        )
         verdict_by_exit = {0: "match", 2: "mismatch", 3: "uncertain", 4: "insufficient"}
         legacy_verdict = verdict_by_exit[exit_code]
         payload_verdict = payload.get("verdict")
@@ -1675,12 +1743,18 @@ class FingerprintRunner:
 
     @staticmethod
     def _offline_environment() -> dict[str, str]:
-        allowed = {"PATH", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "SYSTEMROOT"}
-        return {
-            name: value
-            for name, value in os.environ.items()
-            if name in allowed or name.startswith("LC_")
+        allowed = {
+            "PATH",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "TMPDIR",
+            "SYSTEMROOT",
+            "NODE_EXTRA_CA_CERTS",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
         }
+        return {name: value for name, value in os.environ.items() if name in allowed}
 
     def _base_arguments(
         self,
@@ -1690,10 +1764,10 @@ class FingerprintRunner:
         concurrency: int,
         *,
         api_key: str | None = None,
-    ) -> tuple[list[str], dict[str, str]]:
+    ) -> tuple[list[str], dict[str, str], str | None]:
         self.ensure_ready()
         arguments = ["node", str(self.cli_path)]
-        credential_arguments, environment, _ = self._credential_arguments(
+        credential_arguments, environment, credential = self._credential_arguments(
             endpoint,
             api_key=api_key,
         )
@@ -1712,34 +1786,30 @@ class FingerprintRunner:
             *credential_arguments,
         ]
         arguments.extend(common)
-        return arguments, environment
+        return arguments, environment, credential
 
     @staticmethod
     def _credential_arguments(
         endpoint: EndpointSpec,
         *,
         api_key: str | None,
-        suppress_cli_default_keys: bool = False,
     ) -> tuple[list[str], dict[str, str], str | None]:
-        environment = os.environ.copy()
+        # Never pass the service's ambient provider credentials to a child CLI.
+        # The API layer must resolve an approved env reference and provide the
+        # resulting value explicitly so it can be scoped to this one process.
+        environment = FingerprintRunner._offline_environment()
+        if endpoint.api_key_env:
+            environment.pop(endpoint.api_key_env, None)
         if api_key is not None:
-            if not api_key:
+            credential = api_key.strip()
+            if not credential:
                 raise ValueError("api_key must not be empty")
             ephemeral_name = f"RELAY_AUDITOR_EPHEMERAL_{uuid4().hex.upper()}"
-            environment[ephemeral_name] = api_key
-            return ["--api-key-env", ephemeral_name], environment, api_key
+            environment[ephemeral_name] = credential
+            return ["--api-key-env", ephemeral_name], environment, credential
 
         if endpoint.api_key_env:
-            credential = os.environ.get(endpoint.api_key_env)
-            if not credential:
-                raise ValueError(f"environment variable is not set: {endpoint.api_key_env}")
-            return ["--api-key-env", endpoint.api_key_env], environment, credential
-
-        if suppress_cli_default_keys:
-            # The paper path is explicit opt-in, including credential selection.
-            # Do not let the child CLI silently borrow an unrelated default key.
-            for name in _DEFAULT_CLI_KEY_ENV_VARS:
-                environment.pop(name, None)
+            raise ValueError("api_key_env must be resolved by the service before sampling")
         return [], environment, None
 
     async def _execute(

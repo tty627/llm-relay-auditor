@@ -1,10 +1,11 @@
-import os
 from time import perf_counter
 from typing import Any
 
 import httpx
 
+from relay_auditor.detectors.preflight import normalize_fingerprint_base_url
 from relay_auditor.schemas import EndpointSpec
+from relay_auditor.secret_safety import reject_secret_echo
 
 
 async def run_smoke(
@@ -12,16 +13,20 @@ async def run_smoke(
     prompt: str,
     *,
     timeout_seconds: float,
+    api_key: str | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> dict[str, Any]:
+    if endpoint.api_key_env and api_key is None:
+        raise ValueError("api_key_env must be resolved by the service before smoke testing")
+    credential = api_key.strip() if api_key is not None else None
+    if api_key is not None and not credential:
+        raise ValueError("api_key must not be empty")
     headers = {"content-type": "application/json"}
-    if endpoint.api_key_env:
-        api_key = os.environ.get(endpoint.api_key_env)
-        if not api_key:
-            raise ValueError(f"environment variable is not set: {endpoint.api_key_env}")
-        headers["authorization"] = f"Bearer {api_key}"
+    if credential:
+        headers["authorization"] = f"Bearer {credential}"
 
-    url = f"{str(endpoint.base_url).rstrip('/')}/chat/completions"
+    normalized_base_url = normalize_fingerprint_base_url(str(endpoint.base_url))
+    url = f"{normalized_base_url}/chat/completions"
     payload = {
         "model": endpoint.model,
         "messages": [{"role": "user", "content": prompt}],
@@ -53,7 +58,7 @@ async def run_smoke(
         and choices[0]["message"].get("content")
     )
     passed = response.is_success and has_content
-    return {
+    result = {
         "verdict": "pass" if passed else "fail",
         "request": {
             "url": url,
@@ -70,3 +75,5 @@ async def run_smoke(
             "request_id": response.headers.get("x-request-id"),
         },
     }
+    reject_secret_echo(result, credential, source="smoke response")
+    return result
