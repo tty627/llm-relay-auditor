@@ -25,3 +25,21 @@ def test_artifact_id_cannot_escape_root(tmp_path: Path) -> None:
         assert "lowercase UUID" in str(error)
     else:
         raise AssertionError("path traversal was accepted")
+
+
+def test_fingerprint_samples_use_a_separate_jsonl_category(tmp_path: Path) -> None:
+    store = EvidenceStore(tmp_path)
+    store.initialize()
+    artifact_id = "00000000-0000-0000-0000-000000000002"
+
+    path = store.fingerprint_samples_path(artifact_id)
+
+    assert path.suffix == ".jsonl"
+    assert path.parent.name == "fingerprint_samples"
+    assert path.parent.is_dir()
+    try:
+        store.write_json("fingerprint_samples", artifact_id, {"raw": "must be JSONL"})
+    except ValueError as error:
+        assert "not a JSON artifact" in str(error)
+    else:
+        raise AssertionError("JSON writer accepted a JSONL evidence category")

@@ -1,0 +1,94 @@
+{
+  "formatVersion": 1,
+  "protocol": "one-token/v1",
+  "model": "gpt-5.5",
+  "collectedAt": "2026-08-20T03:50:33.278Z",
+  "samplesPerCell": 15,
+  "postReasoning": false,
+  "cells": {
+    "random-number-1-100:en": {
+      "cellId": "random-number-1-100:en",
+      "counts": {
+        "42": 4,
+        "47": 6,
+        "57": 1,
+        "70": 2,
+        "73": 2
+      },
+      "validCount": 15,
+      "invalidCount": 0,
+      "refusalCount": 0,
+      "emptyCount": 0,
+      "errorCount": 0,
+      "totalCount": 15,
+      "entropyBits": 2.0729055953200564,
+      "normalizedEntropy": 0.31200338118551946,
+      "medianLatencyMs": 4709.332915999999,
+      "meanCompletionTokens": 36.13333333333333,
+      "meanReasoningTokens": 43.3
+    },
+    "random-number-1-100:zh": {
+      "cellId": "random-number-1-100:zh",
+      "counts": {
+        "7": 1,
+        "37": 2,
+        "42": 5,
+        "47": 7
+      },
+      "validCount": 15,
+      "invalidCount": 0,
+      "refusalCount": 0,
+      "emptyCount": 0,
+      "errorCount": 0,
+      "totalCount": 15,
+      "entropyBits": 1.6894822670191827,
+      "normalizedEntropy": 0.2542924197575789,
+      "medianLatencyMs": 3184.7130840000027,
+      "meanCompletionTokens": 47.53333333333333,
+      "meanReasoningTokens": 43.5
+    },
+    "random-color:en": {
+      "cellId": "random-color:en",
+      "counts": {
+        "teal": 5,
+        "cerulean": 8,
+        "turquoise": 1,
+        "vermilion": 1
+      },
+      "validCount": 15,
+      "invalidCount": 0,
+      "refusalCount": 0,
+      "emptyCount": 0,
+      "errorCount": 0,
+      "totalCount": 15,
+      "entropyBits": 1.532914563979398,
+      "normalizedEntropy": 0.31240039575190415,
+      "medianLatencyMs": 3693.728624999989,
+      "meanCompletionTokens": 24.266666666666666,
+      "meanReasoningTokens": 15.6
+    },
+    "random-animal:en": {
+      "cellId": "random-animal:en",
+      "counts": {
+        "otter": 10,
+        "aardvark": 3,
+        "capybara": 1,
+        "tiger": 1
+      },
+      "validCount": 15,
+      "invalidCount": 0,
+      "refusalCount": 0,
+      "emptyCount": 0,
+      "errorCount": 0,
+      "totalCount": 15,
+      "entropyBits": 1.3752793655393791,
+      "normalizedEntropy": 0.24367725173987356,
+      "medianLatencyMs": 3891.6589170000007,
+      "meanCompletionTokens": 27.466666666666665,
+      "meanReasoningTokens": 27.5
+    }
+  },
+  "meta": {
+    "tool": "llm-fingerprint-detector"
+  }
+}
