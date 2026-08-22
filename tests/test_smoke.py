@@ -12,6 +12,7 @@ from relay_auditor.schemas import EndpointSpec
 async def test_smoke_collects_safe_evidence() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers.get("authorization") is None
+        assert str(request.url) == "https://mock.example/v1/chat/completions"
         return httpx.Response(
             200,
             headers={"x-request-id": "req-test"},
@@ -23,7 +24,7 @@ async def test_smoke_collects_safe_evidence() -> None:
         )
 
     result = await run_smoke(
-        EndpointSpec(base_url="https://mock.example/v1", model="reference-model"),
+        EndpointSpec(base_url="https://mock.example", model="reference-model"),
         "Reply with exactly: AUDIT_OK",
         timeout_seconds=5,
         transport=httpx.MockTransport(handler),

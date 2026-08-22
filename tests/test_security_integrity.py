@@ -457,6 +457,9 @@ def test_managed_api_key_requires_explicit_allowlist_and_is_not_persisted(
         _settings(
             allowed_path,
             allowed_api_key_envs="RELAY_AUDIT_KEY",
+            api_key_base_url_bindings=json.dumps(
+                {"RELAY_AUDIT_KEY": ["https://relay.example/v1"]}
+            ),
             access_token=access_token,
         )
     )

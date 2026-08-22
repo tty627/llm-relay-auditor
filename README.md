@@ -19,6 +19,9 @@
 One Token 论文对照、legacy 偏差、V2 改造状态与上线门槛见
 [《One Token 方法审计与改造状态》](./docs/one-token-method-status.md)。
 
+2026-08-21 真实中转端测试观察、自动拉取阻塞点与后续修复边界见
+[《真实中转端测试与自动化边界》](./docs/relay-live-test-findings-2026-08-21.md)。
+
 ## 本地启动
 
 ```bash
@@ -106,6 +109,7 @@ python scripts/calibrate_mock.py
 ```bash
 git submodule update --init --recursive
 export AUDITOR_ACCESS_TOKEN="$(openssl rand -hex 32)"
+export AUDITOR_MANAGEMENT_TOKEN="$AUDITOR_ACCESS_TOKEN"
 docker compose up --build
 ```
 
@@ -121,7 +125,47 @@ Compose 使用 PostgreSQL 保存审计记录，并要求显式设置随机访问
 
 ```bash
 export AUDITOR_ALLOWED_API_KEY_ENVS='RELAY_AUDIT_KEY'
+export AUDITOR_API_KEY_BASE_URL_BINDINGS='{"RELAY_AUDIT_KEY":["https://relay.example.com/v1"]}'
+export AUDITOR_MANAGEMENT_TOKEN="${AUDITOR_MANAGEMENT_TOKEN:-$AUDITOR_ACCESS_TOKEN}"
 export RELAY_AUDIT_KEY='...'
+
+admin_curl() {
+  printf 'header = "X-Relay-Auditor-Token: %s"\n' "$AUDITOR_MANAGEMENT_TOKEN" \
+    | curl --config - "$@"
+}
+```
+
+`AUDITOR_ALLOWED_API_KEY_ENVS` 是逗号分隔的显式白名单。服务只会解析白名单中的
+变量；`AUDITOR_API_KEY_BASE_URL_BINDINGS` 还必须把每个变量绑定到允许接收该 Key 的
+Base URL。创建登记和实际执行都会检查这个运维侧映射，API 调用方不能靠自行登记其他
+地址绕过。所有使用托管 Key 的登记、发现和审计还必须提供至少 24 字符的本地管理令牌；
+未单独设置 `AUDITOR_MANAGEMENT_TOKEN` 时，服务会复用 `AUDITOR_ACCESS_TOKEN`；
+示例函数通过标准输入把令牌交给 curl，避免把令牌展开到进程参数。采样子进程只获得
+当前任务对应的随机临时变量，不继承服务进程里的其他供应商 Key。
+托管 Key 只允许发送到 HTTPS Base URL；只有显式的 `localhost`、`127.0.0.1` 或 `::1`
+回环地址可使用 HTTP。
+
+首次使用时，先把环境变量名与固定的 Base URL、模型登记绑定：
+
+```bash
+endpoint_id="$(admin_curl -sS http://127.0.0.1:8000/api/v1/endpoints \
+    -H 'content-type: application/json' \
+    -d '{
+      "name": "approved-relay-model",
+      "provider": "relay",
+      "base_url": "https://relay.example.com/v1",
+      "model": "claimed-model",
+      "api_key_env": "RELAY_AUDIT_KEY"
+    }' \
+  | python -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+```
+
+之后可以在不传明文 Key 的情况下拉取该端点模型列表；裸域地址会与采样路径一样规范化
+到 `/v1`，429/502/503/504 会进行有界重试：
+
+```bash
+admin_curl -sS -X POST \
+  "http://127.0.0.1:8000/api/v1/endpoints/${endpoint_id}/models"
 ```
 
 `AUDITOR_ALLOWED_API_KEY_ENVS` 是逗号分隔的显式白名单。服务只会读取白名单中的
@@ -164,6 +208,16 @@ curl -sS http://127.0.0.1:8000/api/v1/audits/smoke \
     }
   }'
 ```
+
+携带 `api_key_env` 的常规审计请求必须通过管理令牌认证，并与一条已启用登记记录的
+`base_url + model + api_key_env` 一致；其中运维配置的 Base URL 绑定是防止 Key 外送的
+安全边界，登记的模型字段用于一致性检查，并不替代请求预算或模型 allowlist。
+服务环境中的 Key 可供脚本在服务重启后重新发起任务，但现有浏览器临时 Key 批次仍不会
+跨服务重启自动续跑。
+
+Compose 示例只显式转发 `RELAY_AUDIT_KEY`；若批准更多 Key 名称，必须在自己的 Compose
+覆盖文件或 Secret 管理器中逐项注入，不能只改 allowlist。默认端口仅绑定
+`127.0.0.1`，远程或多用户部署仍需外层身份认证、预算控制和 KMS/Vault。
 
 `.env`、`.env.local`、证据和数据库都不会进入 Git。不要把真实密钥写入命令行参数、请求体或报告。
 

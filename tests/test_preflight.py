@@ -1,5 +1,4 @@
 import asyncio
-import json
 
 import httpx
 import pytest
@@ -11,7 +10,7 @@ from relay_auditor.detectors.preflight import (
 from relay_auditor.schemas import EndpointSpec
 
 
-def test_preflight_redacts_api_key_echoed_in_request_id() -> None:
+def test_preflight_rejects_api_key_echoed_in_request_id() -> None:
     secret = "sk-preflight-request-id-echo-must-not-persist"
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -22,17 +21,18 @@ def test_preflight_redacts_api_key_echoed_in_request_id() -> None:
             json={"choices": [{"message": {"content": "42"}}]},
         )
 
-    result = asyncio.run(
-        run_fingerprint_preflight(
-            EndpointSpec(base_url="https://relay.example/v1", model="model-a"),
-            api_key=secret,
-            timeout_seconds=3,
-            transport=httpx.MockTransport(handler),
+    with pytest.raises(RuntimeError) as caught:
+        asyncio.run(
+            run_fingerprint_preflight(
+                EndpointSpec(base_url="https://relay.example/v1", model="model-a"),
+                api_key=secret,
+                timeout_seconds=3,
+                transport=httpx.MockTransport(handler),
+            )
         )
-    )
 
-    assert result["requestId"] == "request/[REDACTED]/suffix"
-    assert secret not in json.dumps(result, ensure_ascii=False)
+    assert "output was rejected" in str(caught.value)
+    assert secret not in str(caught.value)
 
 
 def test_preflight_redacts_api_key_before_truncating_remote_error() -> None:

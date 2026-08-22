@@ -14,10 +14,11 @@ from uuid import uuid4
 from relay_auditor.one_token_decision import build_safe_decision
 from relay_auditor.one_token_policy import ComparisonScope, ThresholdPolicy
 from relay_auditor.schemas import EndpointSpec
+from relay_auditor.secret_safety import reject_secret_artifact
 
 _PAPER_PROTOCOL = "bruckner-2026-canonical40/v1"
 _CREDENTIAL_ECHO_ERROR = (
-    "One Token output contained a possible credential echo and was discarded"
+    "One Token output was rejected because it contained a possible credential echo"
 )
 _PAPER_CELL_COUNT = 40
 _PAPER_LANGUAGE_ORDER = ("en", "ru", "zh", "ar")
@@ -298,7 +299,7 @@ class FingerprintRunner:
         concurrency: int,
         api_key: str | None = None,
     ) -> dict[str, Any]:
-        arguments, environment = self._base_arguments(
+        arguments, environment, credential = self._base_arguments(
             endpoint,
             cells,
             samples,
@@ -314,16 +315,16 @@ class FingerprintRunner:
                 environment=environment,
             )
         except asyncio.CancelledError:
-            self._discard_credential_echo(output_path, credential=api_key)
+            self._discard_credential_echo(output_path, credential=credential)
             raise
         except Exception as error:
-            if self._discard_credential_echo(output_path, credential=api_key):
+            if self._discard_credential_echo(output_path, credential=credential):
                 raise RuntimeError(_CREDENTIAL_ECHO_ERROR) from error
             raise
         if self._discard_credential_echo(
             output_path,
             payload=payload,
-            credential=api_key,
+            credential=credential,
         ):
             raise RuntimeError(_CREDENTIAL_ECHO_ERROR)
         return payload
@@ -509,7 +510,7 @@ class FingerprintRunner:
         request_timeout_ms: int | None = None,
         idle_timeout_seconds: float | None = None,
     ) -> tuple[str, dict[str, Any]]:
-        arguments, environment = self._base_arguments(
+        arguments, environment, credential = self._base_arguments(
             endpoint,
             cells,
             samples,
@@ -547,7 +548,7 @@ class FingerprintRunner:
                     idle_timeout_seconds=idle_timeout_seconds,
                 )
         except FingerprintPausedError as error:
-            if self._discard_credential_echo(output_path, credential=api_key):
+            if self._discard_credential_echo(output_path, credential=credential):
                 raise RuntimeError(_CREDENTIAL_ECHO_ERROR) from error
             summary = self.mark_partial_artifact(
                 output_path,
@@ -556,14 +557,14 @@ class FingerprintRunner:
             error.partial_artifact = summary
             raise
         except asyncio.CancelledError:
-            self._discard_credential_echo(output_path, credential=api_key)
+            self._discard_credential_echo(output_path, credential=credential)
             self.mark_partial_artifact(
                 output_path,
                 incomplete_reason="execution_interrupted",
             )
             raise
         except FingerprintStalledError as error:
-            if self._discard_credential_echo(output_path, credential=api_key):
+            if self._discard_credential_echo(output_path, credential=credential):
                 raise RuntimeError(_CREDENTIAL_ECHO_ERROR) from error
             summary = self.mark_partial_artifact(
                 output_path,
@@ -572,28 +573,35 @@ class FingerprintRunner:
             error.partial_artifact = summary
             raise
         except InvalidCliJsonError as error:
-            if self._discard_credential_echo(output_path, credential=api_key):
+            if self._discard_credential_echo(output_path, credential=credential):
                 raise RuntimeError(_CREDENTIAL_ECHO_ERROR) from error
             try:
-                return await self._recover_verify(
+                recovered_verdict, recovered_payload = await self._recover_verify(
                     reference_path=reference_path,
                     target_path=output_path,
                     recovery_reason="invalid_verify_stdout_json",
                     cli_stdout_diagnostic=error.safe_diagnostic,
                 )
+                reject_secret_artifact(
+                    recovered_payload,
+                    credential,
+                    paths=(output_path,),
+                    source="One Token fingerprint recovery",
+                )
+                return recovered_verdict, recovered_payload
             except Exception as recovery_error:
                 raise RuntimeError(
                     f"{error} Offline recovery from the saved target fingerprint failed: "
                     f"{recovery_error}"
                 ) from error
         except Exception as error:
-            if self._discard_credential_echo(output_path, credential=api_key):
+            if self._discard_credential_echo(output_path, credential=credential):
                 raise RuntimeError(_CREDENTIAL_ECHO_ERROR) from error
             raise
         if self._discard_credential_echo(
             output_path,
             payload=payload,
-            credential=api_key,
+            credential=credential,
         ):
             raise RuntimeError(_CREDENTIAL_ECHO_ERROR)
         verdict_by_exit = {0: "match", 2: "mismatch", 3: "uncertain", 4: "insufficient"}
@@ -1741,12 +1749,18 @@ class FingerprintRunner:
 
     @staticmethod
     def _offline_environment() -> dict[str, str]:
-        allowed = {"PATH", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "SYSTEMROOT"}
-        return {
-            name: value
-            for name, value in os.environ.items()
-            if name in allowed or name.startswith("LC_")
+        allowed = {
+            "PATH",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "TMPDIR",
+            "SYSTEMROOT",
+            "NODE_EXTRA_CA_CERTS",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
         }
+        return {name: value for name, value in os.environ.items() if name in allowed}
 
     def _base_arguments(
         self,
@@ -1757,12 +1771,12 @@ class FingerprintRunner:
         *,
         subcommand: str,
         api_key: str | None = None,
-    ) -> tuple[list[str], dict[str, str]]:
+    ) -> tuple[list[str], dict[str, str], str | None]:
         self.ensure_ready()
         if subcommand not in {"fingerprint", "verify"}:
             raise ValueError("unsupported endpoint subcommand")
         arguments = ["node", str(self.cli_path), subcommand]
-        credential_arguments, environment, _ = self._credential_arguments(
+        credential_arguments, environment, credential = self._credential_arguments(
             endpoint,
             api_key=api_key,
         )
@@ -1780,7 +1794,7 @@ class FingerprintRunner:
             *credential_arguments,
         ]
         arguments.extend(common)
-        return arguments, environment
+        return arguments, environment, credential
 
     @staticmethod
     def _credential_arguments(
@@ -1791,14 +1805,19 @@ class FingerprintRunner:
         # Start from the same small environment used by offline comparison. This
         # prevents the child CLI from silently borrowing ambient provider keys.
         environment = FingerprintRunner._offline_environment()
+        if endpoint.api_key_env:
+            environment.pop(endpoint.api_key_env, None)
         if api_key is None:
+            if endpoint.api_key_env:
+                raise ValueError("api_key_env must be resolved by the service before sampling")
             return [], environment, None
-        if not api_key:
+        credential = api_key.strip()
+        if not credential:
             raise ValueError("api_key must not be empty")
 
         ephemeral_name = f"RELAY_AUDITOR_EPHEMERAL_{uuid4().hex.upper()}"
-        environment[ephemeral_name] = api_key
-        return ["--api-key-env", ephemeral_name], environment, api_key
+        environment[ephemeral_name] = credential
+        return ["--api-key-env", ephemeral_name], environment, credential
 
     @staticmethod
     def _credential_variants(credential: str) -> set[str]:

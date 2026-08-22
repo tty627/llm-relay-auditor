@@ -6,14 +6,15 @@ import secrets
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import urlparse
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response, Security
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import IntegrityError
 
@@ -26,6 +27,7 @@ from relay_auditor.detectors.fingerprint import (
     safeguard_verification_result,
 )
 from relay_auditor.detectors.models import discover_models
+from relay_auditor.detectors.preflight import normalize_fingerprint_base_url
 from relay_auditor.detectors.smoke import run_smoke
 from relay_auditor.detectors.tokenizer import (
     collect_tokenizer_fingerprint,
@@ -42,6 +44,8 @@ from relay_auditor.schemas import (
     ConsoleModelDiscoveryRequest,
     ConsoleReferenceCollectRequest,
     ConsoleReferenceCollectResponse,
+    EndpointSpec,
+    EphemeralConnectionSpec,
     FingerprintCollectRequest,
     FingerprintVerifyRequest,
     ManagedEndpointCreateRequest,
@@ -53,6 +57,7 @@ from relay_auditor.schemas import (
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     configured = settings or Settings()
+    configured.validate_managed_credential_configuration()
     database = Database(configured.database_url)
     evidence = EvidenceStore(configured.evidence_dir)
     fingerprint = FingerprintRunner(configured.fingerprint_cli_path)
@@ -80,6 +85,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.fingerprint = fingerprint
     app.state.batches = batches
     app.include_router(mock_router)
+    management_token_header = APIKeyHeader(
+        name="X-Relay-Auditor-Token",
+        scheme_name="ManagedCredentialToken",
+        description="Local management token required when api_key_env is used.",
+        auto_error=False,
+    )
 
     @app.exception_handler(RequestValidationError)
     async def redact_request_validation_error(
@@ -129,21 +140,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return False
         return username == "auditor" and secrets.compare_digest(password, expected)
 
-    def require_server_credential_access(request: Request) -> None:
-        if not configured.reveal_access_token():
+    def has_valid_management_token(presented: str | None) -> bool:
+        expected = configured.management_token_value()
+        return bool(
+            expected is not None
+            and presented is not None
+            and secrets.compare_digest(presented, expected)
+        )
+
+    def require_managed_credential_access(
+        request: Request,
+        presented_management_token: str | None,
+    ) -> None:
+        if has_valid_access_token(request) or has_valid_management_token(
+            presented_management_token
+        ):
+            return
+        if configured.management_token_value() is None:
             raise HTTPException(
                 status_code=403,
                 detail=(
                     "server-managed credentials are disabled until "
-                    "AUDITOR_ACCESS_TOKEN is configured"
+                    "AUDITOR_MANAGEMENT_TOKEN or AUDITOR_ACCESS_TOKEN is configured"
                 ),
             )
-        if not has_valid_access_token(request):
-            raise HTTPException(
-                status_code=401,
-                detail="valid access credentials are required for server-managed credentials",
-                headers={"WWW-Authenticate": 'Basic realm="Relay Auditor"'},
-            )
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "valid X-Relay-Auditor-Token or server access credentials are required "
+                "for managed credentials"
+            ),
+        )
 
     def endpoint_response_payload(
         endpoint_payload: dict[str, Any],
@@ -220,8 +247,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 content={"detail": "API origin is not allowed"},
             )
         response = await call_next(request)
-        if is_console_api:
+        if is_console_api or request.headers.get("x-relay-auditor-token") is not None:
             response.headers["Cache-Control"] = "no-store"
+        if is_console_api:
             response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
         return response
 
@@ -240,18 +268,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "X-Content-Type-Options": "nosniff",
         }
 
-    def resolve_managed_api_key(endpoint: Any, request: Request) -> str | None:
+    def resolve_managed_api_key(
+        endpoint: Any,
+        request: Request,
+        presented_management_token: str | None = None,
+    ) -> str | None:
         try:
             if endpoint.api_key_env is None:
                 return None
-            require_server_credential_access(request)
-            configured.require_allowed_api_key_env(endpoint.api_key_env)
-            normalized_base_url = str(endpoint.base_url).rstrip("/")
+            require_managed_credential_access(request, presented_management_token)
+            configured.require_api_key_base_url_binding(
+                endpoint.api_key_env,
+                str(endpoint.base_url),
+            )
+            normalized_base_url = normalize_fingerprint_base_url(str(endpoint.base_url))
             bound = any(
                 managed.enabled
                 and managed.api_key_env == endpoint.api_key_env
                 and managed.model == endpoint.model
-                and managed.base_url.rstrip("/") == normalized_base_url
+                and normalize_fingerprint_base_url(managed.base_url) == normalized_base_url
                 for managed in database.list_endpoints()
             )
             if not bound:
@@ -259,7 +294,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "api_key_env is not bound to this base_url and model in the endpoint registry"
                 )
             return configured.resolve_api_key(endpoint.api_key_env)
-        except ValueError as error:
+        except (ValueError, RuntimeError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     def verified_reference_path(
@@ -388,16 +423,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def create_endpoint(
         payload: ManagedEndpointCreateRequest,
         request: Request,
+        management_token: Annotated[str | None, Security(management_token_header)],
     ) -> dict[str, object]:
         if payload.api_key_env is not None:
-            require_server_credential_access(request)
+            require_managed_credential_access(request, management_token)
         try:
-            configured.require_allowed_api_key_env(payload.api_key_env)
+            configured.require_api_key_base_url_binding(
+                payload.api_key_env,
+                str(payload.base_url),
+            )
             endpoint = database.create_endpoint(
                 endpoint_id=str(uuid4()),
                 name=payload.name,
                 provider=payload.provider,
-                base_url=str(payload.base_url),
+                base_url=normalize_fingerprint_base_url(str(payload.base_url)),
                 model=payload.model,
                 protocol=payload.protocol,
                 api_key_env=payload.api_key_env,
@@ -410,7 +449,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/v1/endpoints")
     async def list_endpoints(request: Request) -> dict[str, object]:
-        authenticated = has_valid_access_token(request)
+        authenticated = has_valid_access_token(request) or has_valid_management_token(
+            request.headers.get("x-relay-auditor-token")
+        )
         items = [
             endpoint_response_payload(
                 endpoint.as_dict(),
@@ -419,6 +460,43 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             for endpoint in database.list_endpoints()
         ]
         return {"items": items}
+
+    @app.post("/api/v1/endpoints/{endpoint_id}/models")
+    async def discover_managed_endpoint_models(
+        endpoint_id: str,
+        response: Response,
+        request: Request,
+        management_token: Annotated[str | None, Security(management_token_header)],
+    ) -> dict[str, Any]:
+        """Discover models without accepting a plaintext credential in the request."""
+
+        response.headers["Cache-Control"] = "no-store"
+        managed = database.get_endpoint(endpoint_id)
+        if managed is None:
+            raise HTTPException(status_code=404, detail="managed endpoint not found")
+        if not managed.enabled:
+            raise HTTPException(status_code=409, detail="managed endpoint is disabled")
+        endpoint = EndpointSpec(
+            base_url=managed.base_url,
+            model=managed.model,
+            api_key_env=managed.api_key_env,
+        )
+        api_key = resolve_managed_api_key(endpoint, request, management_token)
+        try:
+            result = await discover_models(
+                EphemeralConnectionSpec(base_url=managed.base_url),
+                timeout_seconds=configured.request_timeout_seconds,
+                api_key=api_key,
+            )
+        except Exception as error:
+            detail = redact_error(error, api_key)
+            raise HTTPException(status_code=502, detail=detail) from error
+        return {
+            **result,
+            "endpoint_id": managed.id,
+            "registered_model": managed.model,
+            "credential_source": "env_ref" if managed.api_key_env else "none",
+        }
 
     @app.post("/api/v1/baselines", status_code=201)
     async def create_baseline(payload: BaselineCreateRequest) -> dict[str, object]:
@@ -434,9 +512,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }[payload.detector]
         if run.detector != expected_detector:
             raise HTTPException(status_code=409, detail="artifact detector does not match baseline")
-        if run.model != endpoint.model or run.target_base_url.rstrip(
-            "/"
-        ) != endpoint.base_url.rstrip("/"):
+        if run.model != endpoint.model or normalize_fingerprint_base_url(
+            run.target_base_url
+        ) != normalize_fingerprint_base_url(endpoint.base_url):
             raise HTTPException(status_code=409, detail="artifact endpoint does not match baseline")
         category = {"one_token": "fingerprints", "tokenizer": "tokenizers"}[
             payload.detector
@@ -466,13 +544,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"items": [baseline.as_dict() for baseline in database.list_baselines(endpoint_id)]}
 
     @app.post("/api/v1/audits/smoke", response_model=AuditResponse)
-    async def smoke_audit(payload: SmokeAuditRequest, request: Request) -> AuditResponse:
-        api_key = resolve_managed_api_key(payload.target, request)
+    async def smoke_audit(
+        payload: SmokeAuditRequest,
+        request: Request,
+        management_token: Annotated[str | None, Security(management_token_header)],
+    ) -> AuditResponse:
+        api_key = resolve_managed_api_key(payload.target, request, management_token)
         audit_id = str(uuid4())
         database.create_run(
             audit_id=audit_id,
             detector="smoke",
-            target_base_url=str(payload.target.base_url),
+            target_base_url=normalize_fingerprint_base_url(str(payload.target.base_url)),
             model=payload.target.model,
         )
         try:
@@ -513,13 +595,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def collect_fingerprint(
         payload: FingerprintCollectRequest,
         request: Request,
+        management_token: Annotated[str | None, Security(management_token_header)],
     ) -> AuditResponse:
-        api_key = resolve_managed_api_key(payload.endpoint, request)
+        api_key = resolve_managed_api_key(payload.endpoint, request, management_token)
         audit_id = str(uuid4())
         database.create_run(
             audit_id=audit_id,
             detector="one_token_collect",
-            target_base_url=str(payload.endpoint.base_url),
+            target_base_url=normalize_fingerprint_base_url(str(payload.endpoint.base_url)),
             model=payload.endpoint.model,
         )
         output_path = evidence.fingerprint_path(audit_id)
@@ -563,14 +646,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def verify_fingerprint(
         payload: FingerprintVerifyRequest,
         request: Request,
+        management_token: Annotated[str | None, Security(management_token_header)],
     ) -> AuditResponse:
-        api_key = resolve_managed_api_key(payload.endpoint, request)
+        api_key = resolve_managed_api_key(payload.endpoint, request, management_token)
         audit_id = str(uuid4())
         target_path: Path | None = None
         database.create_run(
             audit_id=audit_id,
             detector="one_token_verify",
-            target_base_url=str(payload.endpoint.base_url),
+            target_base_url=normalize_fingerprint_base_url(str(payload.endpoint.base_url)),
             model=payload.endpoint.model,
         )
         try:
@@ -1027,7 +1111,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if isinstance(endpoint_payload, dict):
                 item["endpoint"] = endpoint_response_payload(
                     endpoint_payload,
-                    authenticated=has_valid_access_token(request),
+                    authenticated=(
+                        has_valid_access_token(request)
+                        or has_valid_management_token(
+                            request.headers.get("x-relay-auditor-token")
+                        )
+                    ),
                 )
             baseline = item["baseline"]
             if isinstance(baseline, dict):
@@ -1108,7 +1197,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         database.create_run(
             audit_id=audit_id,
             detector="one_token_collect",
-            target_base_url=str(endpoint.base_url),
+            target_base_url=normalize_fingerprint_base_url(str(endpoint.base_url)),
             model=endpoint.model,
         )
         output_path = evidence.fingerprint_path(audit_id)
@@ -1220,7 +1309,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         database.create_run(
             audit_id=audit_id,
             detector="one_token_verify",
-            target_base_url=str(endpoint.base_url),
+            target_base_url=normalize_fingerprint_base_url(str(endpoint.base_url)),
             model=endpoint.model,
         )
         try:
@@ -1304,13 +1393,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def collect_tokenizer(
         payload: TokenizerCollectRequest,
         request: Request,
+        management_token: Annotated[str | None, Security(management_token_header)],
     ) -> AuditResponse:
-        api_key = resolve_managed_api_key(payload.endpoint, request)
+        api_key = resolve_managed_api_key(payload.endpoint, request, management_token)
         audit_id = str(uuid4())
         database.create_run(
             audit_id=audit_id,
             detector="tokenizer_collect",
-            target_base_url=str(payload.endpoint.base_url),
+            target_base_url=normalize_fingerprint_base_url(str(payload.endpoint.base_url)),
             model=payload.endpoint.model,
         )
         try:
@@ -1352,13 +1442,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def verify_tokenizer(
         payload: TokenizerVerifyRequest,
         request: Request,
+        management_token: Annotated[str | None, Security(management_token_header)],
     ) -> AuditResponse:
-        api_key = resolve_managed_api_key(payload.endpoint, request)
+        api_key = resolve_managed_api_key(payload.endpoint, request, management_token)
         audit_id = str(uuid4())
         database.create_run(
             audit_id=audit_id,
             detector="tokenizer_verify",
-            target_base_url=str(payload.endpoint.base_url),
+            target_base_url=normalize_fingerprint_base_url(str(payload.endpoint.base_url)),
             model=payload.endpoint.model,
         )
         try:

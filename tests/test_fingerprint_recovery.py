@@ -64,14 +64,11 @@ def test_child_credential_environment_is_minimal_and_explicit(monkeypatch) -> No
         api_key_env="RELAY_SELECTED_KEY",
     )
 
-    arguments, environment, credential = FingerprintRunner._credential_arguments(
-        endpoint,
-        api_key=None,
-    )
-    assert arguments == []
-    assert credential is None
-    assert ambient_default not in environment.values()
-    assert selected_secret not in environment.values()
+    with pytest.raises(ValueError, match="must be resolved by the service"):
+        FingerprintRunner._credential_arguments(
+            endpoint,
+            api_key=None,
+        )
 
     arguments, environment, credential = FingerprintRunner._credential_arguments(
         endpoint,
@@ -84,6 +81,8 @@ def test_child_credential_environment_is_minimal_and_explicit(monkeypatch) -> No
         **FingerprintRunner._offline_environment(),
         ephemeral_name: explicit_secret,
     }
+    assert ambient_default not in environment.values()
+    assert selected_secret not in environment.values()
     assert credential == explicit_secret
 
 
@@ -122,7 +121,7 @@ async def test_collect_discards_legacy_normalized_credential_echo(
         )
 
     assert str(caught.value) == (
-        "One Token output contained a possible credential echo and was discarded"
+        "One Token output was rejected because it contained a possible credential echo"
     )
     assert secret not in str(caught.value)
     assert normalized_secret not in str(caught.value)

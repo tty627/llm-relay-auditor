@@ -7,7 +7,9 @@ from typing import Any
 
 import httpx
 
+from relay_auditor.detectors.preflight import normalize_fingerprint_base_url
 from relay_auditor.schemas import EndpointSpec
+from relay_auditor.secret_safety import reject_secret_echo
 
 REPETITIONS = [0, 1, 2, 4, 8]
 PROBE_UNITS = {
@@ -51,12 +53,16 @@ async def collect_tokenizer_fingerprint(
     samples_per_point: int,
     concurrency: int,
     api_key: str | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
 ) -> dict[str, Any]:
+    if endpoint.api_key_env and api_key is None:
+        raise ValueError("api_key_env must be resolved by the service before tokenizer sampling")
+    credential = api_key.strip() if api_key is not None else None
+    if api_key is not None and not credential:
+        raise ValueError("api_key must not be empty")
     headers = {"content-type": "application/json"}
-    if api_key is not None:
-        if not api_key:
-            raise ValueError("api_key must not be empty")
-        headers["authorization"] = f"Bearer {api_key}"
+    if credential:
+        headers["authorization"] = f"Bearer {credential}"
 
     jobs = [
         (probe_id, repetition, sample_index)
@@ -66,12 +72,17 @@ async def collect_tokenizer_fingerprint(
     ]
     random.SystemRandom().shuffle(jobs)
     semaphore = asyncio.Semaphore(concurrency)
-    url = f"{str(endpoint.base_url).rstrip('/')}/chat/completions"
+    normalized_base_url = normalize_fingerprint_base_url(str(endpoint.base_url))
+    url = f"{normalized_base_url}/chat/completions"
     results: dict[str, dict[int, list[int]]] = {
         probe_id: {repetition: [] for repetition in REPETITIONS} for probe_id in PROBE_UNITS
     }
 
-    async with httpx.AsyncClient(timeout=timeout_seconds, follow_redirects=False) as client:
+    async with httpx.AsyncClient(
+        timeout=timeout_seconds,
+        transport=transport,
+        follow_redirects=False,
+    ) as client:
 
         async def run_job(probe_id: str, repetition: int, _: int) -> tuple[str, int, int]:
             prompt = f"{PROMPT_PREFIX}\n{PROBE_UNITS[probe_id] * repetition}"
@@ -115,10 +126,10 @@ async def collect_tokenizer_fingerprint(
         }
         slope_vector[probe_id] = fit["slope"]
 
-    return {
+    result = {
         "protocol": "tokenizer-slope/v1",
         "model": endpoint.model,
-        "base_url": str(endpoint.base_url),
+        "base_url": normalized_base_url,
         "collected_at": datetime.now(UTC).isoformat(),
         "repetitions": REPETITIONS,
         "samples_per_point": samples_per_point,
@@ -126,6 +137,8 @@ async def collect_tokenizer_fingerprint(
         "slope_vector": slope_vector,
         "unstable_probes": unstable_probes,
     }
+    reject_secret_echo(result, credential, source="tokenizer response")
+    return result
 
 
 def compare_tokenizer_fingerprints(

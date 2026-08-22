@@ -5,7 +5,9 @@ from typing import Any
 
 import httpx
 
+from relay_auditor.detectors.preflight import normalize_fingerprint_base_url
 from relay_auditor.schemas import EndpointSpec
+from relay_auditor.secret_safety import reject_secret_echo
 
 
 def _redact_api_key_echo(value: Any, api_key: str | None) -> Any:
@@ -44,11 +46,17 @@ async def run_smoke(
     api_key: str | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> dict[str, Any]:
+    if endpoint.api_key_env and api_key is None:
+        raise ValueError("api_key_env must be resolved by the service before smoke testing")
+    credential = api_key.strip() if api_key is not None else None
+    if api_key is not None and not credential:
+        raise ValueError("api_key must not be empty")
     headers = {"content-type": "application/json"}
-    if api_key:
-        headers["authorization"] = f"Bearer {api_key}"
+    if credential:
+        headers["authorization"] = f"Bearer {credential}"
 
-    url = f"{str(endpoint.base_url).rstrip('/')}/chat/completions"
+    normalized_base_url = normalize_fingerprint_base_url(str(endpoint.base_url))
+    url = f"{normalized_base_url}/chat/completions"
     payload = {
         "model": endpoint.model,
         "messages": [{"role": "user", "content": prompt}],
@@ -83,20 +91,24 @@ async def run_smoke(
         and choices[0]["message"].get("content")
     )
     passed = response.is_success and has_content
-    return {
+    result = {
         "verdict": "pass" if passed else "fail",
         "request": {
-            "url": _redact_api_key_echo(url, api_key),
-            "model": _redact_api_key_echo(endpoint.model, api_key),
-            "prompt": _redact_api_key_echo(prompt, api_key),
-            "api_key_env": _redact_api_key_echo(endpoint.api_key_env, api_key),
+            "url": _redact_api_key_echo(url, credential),
+            "model": _redact_api_key_echo(endpoint.model, credential),
+            "prompt": _redact_api_key_echo(prompt, credential),
+            "api_key_env": _redact_api_key_echo(endpoint.api_key_env, credential),
         },
         "response": {
             "status_code": response.status_code,
             "latency_ms": latency_ms,
-            "model": _redact_api_key_echo(response_json.get("model"), api_key),
-            "usage": _redact_api_key_echo(response_json.get("usage"), api_key),
+            "model": _redact_api_key_echo(response_json.get("model"), credential),
+            "usage": _redact_api_key_echo(response_json.get("usage"), credential),
             "has_content": has_content,
-            "request_id": _redact_api_key_echo(response.headers.get("x-request-id"), api_key),
+            "request_id": _redact_api_key_echo(
+                response.headers.get("x-request-id"), credential
+            ),
         },
     }
+    reject_secret_echo(result, credential, source="smoke response")
+    return result

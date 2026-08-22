@@ -1,7 +1,9 @@
+import math
 import re
 import unicodedata
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from ipaddress import ip_address
 from time import perf_counter
 from typing import Any
 from urllib.parse import urlsplit
@@ -9,6 +11,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from relay_auditor.schemas import EndpointSpec
+from relay_auditor.secret_safety import reject_secret_echo
 
 
 class FingerprintPreflightError(RuntimeError):
@@ -36,12 +39,35 @@ def normalize_fingerprint_base_url(base_url: str) -> str:
     parsed = urlsplit(base_url.strip())
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise FingerprintPreflightError("预检失败：中转站地址无效")
+    if parsed.username is not None or parsed.password is not None:
+        raise FingerprintPreflightError("预检失败：中转站地址不得包含凭据")
+    if parsed.query or parsed.fragment:
+        raise FingerprintPreflightError("预检失败：中转站地址不得包含查询参数或片段")
+    hostname = parsed.hostname
+    if hostname is None:
+        raise FingerprintPreflightError("预检失败：中转站地址无效")
+    try:
+        address = ip_address(hostname)
+    except ValueError:
+        canonical_host = hostname.encode("idna").decode("ascii").lower()
+    else:
+        canonical_host = address.compressed
+        if address.version == 6:
+            canonical_host = f"[{canonical_host}]"
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise FingerprintPreflightError("预检失败：中转站端口无效") from error
+    default_port = (parsed.scheme == "https" and port == 443) or (
+        parsed.scheme == "http" and port == 80
+    )
+    authority = canonical_host if port is None or default_port else f"{canonical_host}:{port}"
     path = parsed.path.rstrip("/")
     if path.endswith("/chat/completions"):
         path = path[: -len("/chat/completions")]
     if not path:
         path = "/v1"
-    return f"{parsed.scheme}://{parsed.netloc}{path}"
+    return f"{parsed.scheme}://{authority}{path}"
 
 
 def _first_adapter_body(base_url: str) -> dict[str, Any]:
@@ -113,7 +139,7 @@ def _safe_error_message(response: httpx.Response, api_key: str | None) -> str | 
     return " ".join(redacted.split())[:240]
 
 
-def _retry_after_seconds(response: httpx.Response) -> float | None:
+def retry_after_seconds(response: httpx.Response) -> float | None:
     """Parse Retry-After without ever following a remote-provided URL."""
 
     value = response.headers.get("retry-after")
@@ -130,6 +156,8 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
         if retry_at.tzinfo is None:
             retry_at = retry_at.replace(tzinfo=UTC)
         seconds = (retry_at - datetime.now(UTC)).total_seconds()
+    if not math.isfinite(seconds):
+        return None
     if seconds < 0:
         return 0.0
     return seconds
@@ -158,11 +186,16 @@ async def run_fingerprint_preflight(
     interruptible cooldown/requeue policy so one slow relay cannot block others.
     """
 
+    if endpoint.api_key_env and api_key is None:
+        raise ValueError("api_key_env must be resolved by the service before preflight")
+    credential = api_key.strip() if api_key is not None else None
+    if api_key is not None and not credential:
+        raise ValueError("api_key must not be empty")
     normalized = normalize_fingerprint_base_url(str(endpoint.base_url))
     url = f"{normalized}/chat/completions"
     headers = {"content-type": "application/json"}
-    if api_key:
-        headers["authorization"] = f"Bearer {api_key}"
+    if credential:
+        headers["authorization"] = f"Bearer {credential}"
     base_payload: dict[str, Any] = {
         "model": endpoint.model,
         "temperature": 1.0,
@@ -224,14 +257,14 @@ async def run_fingerprint_preflight(
         if explanation is None and status_code >= 500:
             explanation = "中转站上游服务暂不可用"
         explanation = explanation or "请求参数或接口不兼容"
-        remote_message = _safe_error_message(response, api_key)
+        remote_message = _safe_error_message(response, credential)
         suffix = f" · {remote_message}" if remote_message else ""
         transient = _is_transient_http_status(status_code)
         raise FingerprintPreflightError(
             f"预检失败：HTTP {status_code}，{explanation}{suffix}；未开始正式采样",
             transient=transient,
             status_code=status_code,
-            retry_after_seconds=_retry_after_seconds(response) if transient else None,
+            retry_after_seconds=retry_after_seconds(response) if transient else None,
             error_kind="http",
         )
 
@@ -247,14 +280,17 @@ async def run_fingerprint_preflight(
         raise FingerprintPreflightError(
             f"预检失败：HTTP {response.status_code} 但没有可见文本；未开始正式采样"
         )
-    return {
+    result = {
         "statusCode": response.status_code,
         "latencyMs": latency_ms,
         "hasContent": True,
-        "requestId": _redact_api_key_echo(response.headers.get("x-request-id"), api_key),
+        "requestId": response.headers.get("x-request-id"),
         "normalizedBaseUrl": normalized,
         "retries": 0,
         "attempts": attempts,
         "strategy": strategy,
         "totalLatencyMs": total_latency_ms,
     }
+    reject_secret_echo(result, credential, source="fingerprint preflight response")
+    result["requestId"] = _redact_api_key_echo(result["requestId"], credential)
+    return result

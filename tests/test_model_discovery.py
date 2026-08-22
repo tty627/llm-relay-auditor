@@ -23,7 +23,7 @@ def test_model_discovery_rejects_credential_echo_without_returning_secret(
         base_url="https://relay.example/v1",
         api_key=secret,
     )
-    with pytest.raises(ValueError) as caught:
+    with pytest.raises(RuntimeError) as caught:
         asyncio.run(
             discover_models(
                 endpoint,

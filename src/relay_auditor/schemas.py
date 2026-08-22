@@ -9,7 +9,7 @@ def reject_url_userinfo(value: AnyHttpUrl) -> AnyHttpUrl:
     if value.username is not None or value.password is not None:
         raise ValueError("base_url must not contain username or password credentials")
     if value.query or value.fragment:
-        raise ValueError("base_url must not contain a query string or fragment")
+        raise ValueError("base_url must not contain query parameters or fragments")
     return value
 
 
@@ -51,7 +51,9 @@ class EphemeralConnectionSpec(BaseModel):
     _reject_base_url_userinfo = field_validator("base_url")(reject_url_userinfo)
 
     def reveal_api_key(self) -> str | None:
-        return self.api_key.get_secret_value() if self.api_key is not None else None
+        if self.api_key is None:
+            return None
+        return self.api_key.get_secret_value().strip()
 
 
 class EphemeralEndpointSpec(EphemeralConnectionSpec):
