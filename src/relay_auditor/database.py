@@ -1,7 +1,9 @@
+import hashlib
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import NAMESPACE_URL, uuid5
 
 from sqlalchemy import (
     JSON,
@@ -398,6 +400,80 @@ class Database:
             session.refresh(record)
             return record
 
+    def create_comparison_batch_queue(
+        self,
+        *,
+        batch_id: str,
+        items: list[dict[str, Any]],
+        cells: int,
+        samples: int,
+        concurrency: int,
+        concurrency_mode: str,
+    ) -> ComparisonBatch:
+        """Persist a complete queued comparison batch in one transaction."""
+
+        if not items:
+            raise ValueError("comparison batch must contain at least one item")
+        now = datetime.now(UTC)
+        batch = ComparisonBatch(
+            id=batch_id,
+            status="running",
+            total_items=len(items),
+            completed_items=0,
+            cells=cells,
+            samples=samples,
+            concurrency=concurrency,
+            created_at=now,
+        )
+        with self.sessions() as session:
+            session.add(batch)
+            for item in items:
+                audit_id = str(item["audit_id"])
+                priority = int(item.get("priority", 50))
+                session.add(
+                    AuditRun(
+                        id=audit_id,
+                        detector="one_token_verify",
+                        status="queued",
+                        target_base_url=str(item["target_base_url"]),
+                        model=str(item["model"]),
+                        started_at=now,
+                    )
+                )
+                session.add(
+                    ComparisonRecord(
+                        audit_id=audit_id,
+                        batch_id=batch_id,
+                        station_name=str(item["station_name"]),
+                        reference_artifact_id=str(item["reference_artifact_id"]),
+                        reference_name=str(item["reference_name"]),
+                        reference_model=str(item["reference_model"]),
+                        created_at=now,
+                    )
+                )
+                session.add(
+                    ComparisonTaskProgress(
+                        audit_id=audit_id,
+                        stage="queued",
+                        done=0,
+                        total=cells * samples,
+                        errors=0,
+                        detail=f"已进入队列 · 优先级 {priority}",
+                        updated_at=now,
+                    )
+                )
+                session.add(
+                    ComparisonTaskOptions(
+                        audit_id=audit_id,
+                        priority=priority,
+                        concurrency_mode=concurrency_mode,
+                        max_concurrency=concurrency,
+                    )
+                )
+            session.commit()
+            session.refresh(batch)
+            return batch
+
     def finish_comparison_record(self, audit_id: str) -> None:
         finished_at = datetime.now(UTC)
         with self.sessions() as session:
@@ -601,8 +677,32 @@ class Database:
                         progress.stage = "interrupted"
                         progress.detail = "服务重启后无法恢复临时凭据"
                         progress.updated_at = now
+            orphan_runs = list(
+                session.scalars(
+                    select(AuditRun)
+                    .outerjoin(
+                        ComparisonRecord,
+                        ComparisonRecord.audit_id == AuditRun.id,
+                    )
+                    .where(
+                        AuditRun.detector == "one_token_verify",
+                        AuditRun.status.in_({"queued", "running", "paused", "canceling"}),
+                        ComparisonRecord.audit_id.is_(None),
+                    )
+                )
+            )
+            for run in orphan_runs:
+                run.status = "interrupted"
+                run.verdict = "error"
+                run.completed_at = now
+                run.error_message = "任务登记未完整提交；服务已按失败关闭原则中断该孤立任务"
+                progress = session.get(ComparisonTaskProgress, run.id)
+                if progress is not None:
+                    progress.stage = "interrupted"
+                    progress.detail = "任务登记不完整，服务重启后已中断"
+                    progress.updated_at = now
             session.commit()
-            return len(batches)
+            return len(batches) + len(orphan_runs)
 
     def get_batch_comparison_rows(
         self,
@@ -743,31 +843,99 @@ class Database:
     ) -> ManagedEndpoint:
         now = datetime.now(UTC)
         with self.sessions() as session:
-            endpoint = session.scalar(select(ManagedEndpoint).where(ManagedEndpoint.name == name))
-            if endpoint is None:
-                endpoint = ManagedEndpoint(
-                    id=endpoint_id,
-                    name=name,
-                    provider=provider,
-                    base_url=base_url,
-                    model=model,
-                    protocol=protocol,
-                    api_key_env=None,
-                    created_at=now,
-                    updated_at=now,
-                )
-                session.add(endpoint)
-            else:
-                endpoint.provider = provider
-                endpoint.base_url = base_url
-                endpoint.model = model
-                endpoint.protocol = protocol
-                endpoint.api_key_env = None
-                endpoint.enabled = True
-                endpoint.updated_at = now
+            endpoint = self.upsert_endpoint_in_session(
+                session,
+                endpoint_id=endpoint_id,
+                name=name,
+                provider=provider,
+                base_url=base_url,
+                model=model,
+                protocol=protocol,
+                now=now,
+            )
             session.commit()
             session.refresh(endpoint)
             return endpoint
+
+    @staticmethod
+    def upsert_endpoint_in_session(
+        session: Session,
+        *,
+        endpoint_id: str,
+        name: str,
+        provider: str,
+        base_url: str,
+        model: str,
+        protocol: str,
+        now: datetime,
+        reuse_by_connection_identity: bool = True,
+    ) -> ManagedEndpoint:
+        """Reuse an exact identity without rewriting a name collision's provenance."""
+
+        identity_filters = (
+            ManagedEndpoint.provider == provider,
+            ManagedEndpoint.base_url == base_url,
+            ManagedEndpoint.model == model,
+            ManagedEndpoint.protocol == protocol,
+        )
+        endpoint = (
+            session.scalar(select(ManagedEndpoint).where(*identity_filters))
+            if reuse_by_connection_identity
+            else session.get(ManagedEndpoint, endpoint_id)
+        )
+        if endpoint is not None:
+            if not reuse_by_connection_identity and (
+                endpoint.provider != provider
+                or endpoint.base_url != base_url
+                or endpoint.model != model
+                or endpoint.protocol != protocol
+            ):
+                endpoint = None
+            else:
+                endpoint.enabled = True
+                endpoint.updated_at = now
+                return endpoint
+
+        identity_parts = (provider, base_url, model, protocol)
+        if not reuse_by_connection_identity:
+            identity_parts = (endpoint_id, name, *identity_parts)
+        identity = "|".join(identity_parts)
+        digest = hashlib.sha256(identity.encode()).hexdigest()
+        candidate_name = name
+        existing_name = session.scalar(
+            select(ManagedEndpoint).where(ManagedEndpoint.name == candidate_name)
+        )
+        if existing_name is not None:
+            for width in (8, 12, 16, 24, 32, 64):
+                suffix = f"-{digest[:width]}"
+                candidate_name = f"{name[: 100 - len(suffix)]}{suffix}"
+                conflict = session.scalar(
+                    select(ManagedEndpoint).where(ManagedEndpoint.name == candidate_name)
+                )
+                if conflict is None:
+                    break
+            else:  # pragma: no cover - a SHA-256 name collision is not practical
+                raise ValueError("cannot allocate a unique endpoint name")
+
+        if session.get(ManagedEndpoint, endpoint_id) is not None:
+            endpoint_id = str(uuid5(NAMESPACE_URL, f"relay-auditor:endpoint:{identity}"))
+            if session.get(ManagedEndpoint, endpoint_id) is not None:
+                raise ValueError("endpoint identity conflicts with an existing endpoint id")
+
+        endpoint = ManagedEndpoint(
+            id=endpoint_id,
+            name=candidate_name,
+            provider=provider,
+            base_url=base_url,
+            model=model,
+            protocol=protocol,
+            api_key_env=None,
+            enabled=True,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(endpoint)
+        return endpoint
 
     def list_endpoints(self) -> list[ManagedEndpoint]:
         with self.sessions() as session:

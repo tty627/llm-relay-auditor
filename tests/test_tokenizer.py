@@ -1,4 +1,9 @@
+import math
+
+import pytest
+
 from relay_auditor.detectors.tokenizer import (
+    PROBE_UNITS,
     compare_tokenizer_fingerprints,
     linear_fit,
 )
@@ -13,26 +18,61 @@ def test_linear_fit_recovers_slope() -> None:
 
 
 def test_tokenizer_comparison_verdicts() -> None:
-    reference = {
-        "slope_vector": {"cjk": 8.0, "english": 6.0},
-        "unstable_probes": [],
-    }
-    same = {
-        "slope_vector": {"cjk": 8.0, "english": 6.0},
-        "unstable_probes": [],
-    }
-    changed = {
-        "slope_vector": {"cjk": 12.0, "english": 9.0},
-        "unstable_probes": [],
-    }
-    unstable = {
-        "slope_vector": {"cjk": 8.0, "english": 6.0},
-        "unstable_probes": ["cjk"],
-    }
+    def evidence(*, scale: float = 1, unstable: list[str] | None = None) -> dict:
+        return {
+            "protocol": "tokenizer-slope/v1",
+            "slope_vector": {
+                probe_id: (index + 1) * scale for index, probe_id in enumerate(PROBE_UNITS)
+            },
+            "unstable_probes": unstable or [],
+        }
 
-    assert compare_tokenizer_fingerprints(reference, same)["verdict"] == "match"
+    reference = evidence()
+    same = evidence()
+    changed = evidence(scale=2)
+    unstable = evidence(unstable=["cjk"])
+    unstable_reference = evidence(unstable=["english"])
+
+    same_result = compare_tokenizer_fingerprints(reference, same)
+    assert same_result["verdict"] == "match"
+    assert same_result["exploratory_verdict"] == "match"
+    assert same_result["operational_verdict"] == "unverifiable"
+    assert same_result["decision_eligible"] is False
     assert compare_tokenizer_fingerprints(reference, changed)["verdict"] == "mismatch"
     assert compare_tokenizer_fingerprints(reference, unstable)["verdict"] == "unstable"
+    assert compare_tokenizer_fingerprints(unstable_reference, changed)["verdict"] == "unstable"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda value: value.pop("protocol"),
+        lambda value: value["slope_vector"].pop("cjk"),
+        lambda value: value["slope_vector"].update({"unknown": 1}),
+        lambda value: value["slope_vector"].update({"cjk": math.nan}),
+        lambda value: value["slope_vector"].update({"cjk": math.inf}),
+        lambda value: value["slope_vector"].update({"cjk": -1}),
+        lambda value: value["slope_vector"].update({"cjk": True}),
+        lambda value: value.update({"unstable_probes": ["unknown"]}),
+    ],
+)
+def test_tokenizer_comparison_rejects_malformed_evidence(mutation) -> None:
+    evidence = {
+        "protocol": "tokenizer-slope/v1",
+        "slope_vector": {probe_id: 1.0 for probe_id in PROBE_UNITS},
+        "unstable_probes": [],
+    }
+    mutation(evidence)
+
+    with pytest.raises(ValueError):
+        compare_tokenizer_fingerprints(
+            evidence,
+            {
+                "protocol": "tokenizer-slope/v1",
+                "slope_vector": {probe_id: 1.0 for probe_id in PROBE_UNITS},
+                "unstable_probes": [],
+            },
+        )
 
 
 def test_mock_has_distinct_token_accounting() -> None:

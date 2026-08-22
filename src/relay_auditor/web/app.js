@@ -111,9 +111,11 @@ function workspaceSnapshot() {
       manualModel: card.querySelector(".target-manual-model").value,
       models: [...card.querySelectorAll(".mapping-row")].map((row) => ({
         model: row.dataset.model,
-        referenceArtifactId: row.querySelector(".mapping-reference").value,
-        enabled: row.querySelector(".mapping-enabled").checked,
+        referenceArtifactId: row.querySelector(".mapping-reference").dataset.preferredArtifactId
+          || row.querySelector(".mapping-reference").value,
+        enabled: row.dataset.enabledIntent === "true",
         priority: Number(row.querySelector(".mapping-priority").value) || 50,
+        source: row.dataset.modelSource || "retained",
       })),
     })),
   };
@@ -173,6 +175,7 @@ function restoreWorkspace() {
         referenceArtifactId: item.referenceArtifactId,
         enabled: item.enabled,
         priority: item.priority,
+        source: item.source,
       });
     });
   });
@@ -712,13 +715,19 @@ function populateReferenceSelect(select, targetModel, preferredArtifactId = "") 
     option.textContent = `${reference.name} · ${reference.model}`;
     select.append(option);
   });
-  const exact = state.references.find((reference) => reference.model === targetModel);
-  if (preferredArtifactId && state.references.some((item) => item.artifactId === preferredArtifactId)) {
-    select.value = preferredArtifactId;
-  } else if (exact) {
-    select.value = exact.artifactId;
+  const selection = relayStatus.referenceSelection(
+    state.references,
+    targetModel,
+    preferredArtifactId,
+  );
+  select.value = selection.artifactId;
+  select.dataset.preferredArtifactId = preferredArtifactId || selection.artifactId;
+  select.dataset.preferredUnavailable = selection.preferredUnavailable ? "true" : "";
+  if (selection.preferredUnavailable) {
+    placeholder.textContent = "指定的历史参考已不可用，请重新选择";
   }
   select.disabled = state.running || state.references.length === 0;
+  return selection;
 }
 
 function updateMappingStatus(row) {
@@ -726,15 +735,43 @@ function updateMappingStatus(row) {
   const enabled = row.querySelector(".mapping-enabled");
   const status = row.querySelector(".mapping-state");
   const reference = state.references.find((item) => item.artifactId === select.value);
+  if (select.dataset.preferredUnavailable === "true") {
+    status.className = "mapping-state badge badge-uncertain";
+    status.textContent = "历史参考不可用";
+    status.title = "历史记录指定的参考指纹已不存在，请手动重新选择；系统不会改用同名模型。";
+    return;
+  }
   if (!reference) {
     status.className = "mapping-state badge badge-muted";
-    status.textContent = "未映射";
+    status.textContent = row.dataset.missingFromDiscovery === "true" ? "未发现 · 已保留" : "未映射";
+    status.title = row.dataset.missingFromDiscovery === "true"
+      ? "最新模型列表未返回此模型，已保留其原有配置。"
+      : "";
     return;
   }
   status.className = enabled.checked
     ? "mapping-state badge badge-match"
     : "mapping-state badge badge-muted";
-  status.textContent = enabled.checked ? "已启用" : "已映射";
+  const mappedText = enabled.checked ? "已启用" : "已映射";
+  status.textContent = row.dataset.missingFromDiscovery === "true"
+    ? `${mappedText} · 未发现`
+    : mappedText;
+  status.title = row.dataset.missingFromDiscovery === "true"
+    ? "最新模型列表未返回此模型，已保留其原有映射。"
+    : "";
+}
+
+function applyMappingEnabledState(row, enabledIntent) {
+  const select = row.querySelector(".mapping-reference");
+  const enabled = row.querySelector(".mapping-enabled");
+  const mappingState = relayStatus.mappingEnabledState(
+    enabledIntent,
+    select.dataset.preferredUnavailable === "true",
+  );
+  row.dataset.enabledIntent = mappingState.enabledIntent ? "true" : "false";
+  row.dataset.referenceAutoDisabled = mappingState.autoDisabled ? "true" : "";
+  enabled.checked = mappingState.checked;
+  return mappingState;
 }
 
 function addTargetModel(card, model, values = {}) {
@@ -748,6 +785,8 @@ function addTargetModel(card, model, values = {}) {
   const fragment = elements.mappingTemplate.content.cloneNode(true);
   const row = fragment.querySelector(".mapping-row");
   row.dataset.model = clean;
+  row.dataset.modelSource = values.source || "retained";
+  row.dataset.missingFromDiscovery = values.missingFromDiscovery ? "true" : "";
   row.querySelector(".mapping-model").textContent = clean;
   const select = row.querySelector(".mapping-reference");
   populateReferenceSelect(select, clean, values.referenceArtifactId || "");
@@ -755,16 +794,20 @@ function addTargetModel(card, model, values = {}) {
   const savedPriority = Number(values.priority);
   priority.value = [80, 50, 20].includes(savedPriority) ? String(savedPriority) : "50";
   const enabled = row.querySelector(".mapping-enabled");
-  enabled.checked = values.enabled === undefined ? Boolean(select.value) : Boolean(values.enabled);
-  row.dataset.userDisabled = enabled.checked ? "" : "true";
+  const enabledIntent = values.enabled === undefined
+    ? Boolean(select.value)
+    : Boolean(values.enabled);
+  applyMappingEnabledState(row, enabledIntent);
   enabled.addEventListener("change", () => {
-    row.dataset.userDisabled = enabled.checked ? "" : "true";
+    row.dataset.enabledIntent = enabled.checked ? "true" : "false";
+    row.dataset.referenceAutoDisabled = "";
     updateMappingStatus(row);
     updateControls();
   });
   select.addEventListener("change", () => {
-    if (select.value) enabled.checked = true;
-    row.dataset.userDisabled = "";
+    select.dataset.preferredArtifactId = select.value;
+    select.dataset.preferredUnavailable = "";
+    applyMappingEnabledState(row, Boolean(select.value));
     updateMappingStatus(row);
     updateControls();
   });
@@ -780,11 +823,9 @@ function refreshAllMappingOptions() {
   targetCards().forEach((card) => {
     card.querySelectorAll(".mapping-row").forEach((row) => {
       const select = row.querySelector(".mapping-reference");
-      const previous = select.value;
+      const previous = select.dataset.preferredArtifactId || select.value;
       populateReferenceSelect(select, row.dataset.model, previous);
-      if (select.value && !row.dataset.userDisabled) {
-        row.querySelector(".mapping-enabled").checked = true;
-      }
+      applyMappingEnabledState(row, row.dataset.enabledIntent === "true");
       updateMappingStatus(row);
     });
   });
@@ -802,9 +843,29 @@ async function fetchTargetModels(card) {
       endpoint: connectionPayload(url, key),
     });
     const list = card.querySelector(".mapping-list");
+    const existing = [...card.querySelectorAll(".mapping-row")].map((row) => {
+      const select = row.querySelector(".mapping-reference");
+      return {
+        model: row.dataset.model,
+        referenceArtifactId: select.dataset.preferredArtifactId || select.value,
+        enabled: row.dataset.enabledIntent === "true",
+        priority: Number(row.querySelector(".mapping-priority").value) || 50,
+        source: row.dataset.modelSource || "retained",
+      };
+    });
+    const merged = relayStatus.mergeTargetModelMappings(existing, body.models || []);
     list.replaceChildren();
-    (body.models || []).forEach((item) => addTargetModel(card, item.id));
-    setTargetState(card, "match", `${body.count} 个模型`, "已按模型 ID 自动匹配可用参考指纹。 ");
+    merged.forEach((item) => addTargetModel(card, item.model, item));
+    const retainedCount = merged.filter((item) => item.missingFromDiscovery).length;
+    const retainedText = retainedCount
+      ? ` 已保留 ${retainedCount} 个最新列表未返回的手工或既有模型及其映射。`
+      : "";
+    setTargetState(
+      card,
+      "match",
+      `${body.count} 个模型`,
+      `已按模型 ID 自动匹配可用参考指纹；原有映射、优先级和启用状态均已保留。${retainedText}`,
+    );
   } catch (error) {
     setTargetState(card, "error", "读取失败", error instanceof Error ? error.message : String(error));
   } finally {
@@ -828,7 +889,7 @@ function addTarget(values = {}) {
   card.querySelector(".fetch-target-models").addEventListener("click", () => fetchTargetModels(card));
   card.querySelector(".add-target-model").addEventListener("click", () => {
     const input = card.querySelector(".target-manual-model");
-    addTargetModel(card, input.value);
+    addTargetModel(card, input.value, { source: "manual" });
     input.value = "";
   });
   elements.targetList.append(card);

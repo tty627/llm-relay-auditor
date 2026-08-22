@@ -152,10 +152,326 @@ def _jsd_from_counts(left: Mapping[str, int], right: Mapping[str, int]) -> float
     return divergence
 
 
+class _RawEvidenceValidationError(ValueError):
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+def _rebuild_raw_evidence(
+    raw_jsonl: bytes,
+    *,
+    fingerprint: Mapping[str, Any],
+    expected_role: str,
+    selected_cells: set[str],
+    samples_per_cell: int,
+) -> dict[str, Any]:
+    """Parse untrusted JSONL bytes and independently rebuild decision inputs."""
+
+    try:
+        text = raw_jsonl.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise _RawEvidenceValidationError("invalid_utf8") from error
+    if not text or not text.endswith("\n"):
+        raise _RawEvidenceValidationError("invalid_jsonl")
+    lines = text.splitlines()
+    expected_samples = len(selected_cells) * samples_per_cell
+    if len(lines) != expected_samples or any(not line for line in lines):
+        raise _RawEvidenceValidationError("plan_mismatch")
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        parsed: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in parsed:
+                raise _RawEvidenceValidationError("duplicate_json_key")
+            parsed[key] = value
+        return parsed
+
+    def reject_nonfinite_number(value: str) -> None:
+        raise _RawEvidenceValidationError("invalid_json")
+
+    categories = ("valid", "invalid", "refusal", "empty", "error")
+    summary: dict[str, Any] = {
+        **{category: 0 for category in categories},
+        "reasoningTraceCount": 0,
+        "reasoningTokenCount": 0,
+        "reasoningUsageObservedSamples": 0,
+        "observableResponseSamples": 0,
+        "cells": {
+            cell_id: {
+                **{category: 0 for category in categories},
+                "total": 0,
+                "counts": {},
+            }
+            for cell_id in selected_cells
+        },
+    }
+    observed_jobs: set[tuple[str, int]] = set()
+    observed_job_ids: set[str] = set()
+    required_fields = {
+        "evidenceVersion",
+        "protocolId",
+        "role",
+        "requestedModel",
+        "jobId",
+        "cellId",
+        "repetitionIndex",
+        "category",
+        "normalized",
+        "normalizationCandidate",
+        "normalizationCategory",
+        "excludedFromDistribution",
+        "exclusionReason",
+        "reasoningTraceFields",
+        "reasoningTraceCharacterCount",
+        "usage",
+        "errorKind",
+    }
+
+    for line in lines:
+        try:
+            sample = json.loads(
+                line,
+                object_pairs_hook=reject_duplicate_keys,
+                parse_constant=reject_nonfinite_number,
+            )
+        except _RawEvidenceValidationError:
+            raise
+        except (json.JSONDecodeError, TypeError, ValueError) as error:
+            raise _RawEvidenceValidationError("invalid_json") from error
+        if not isinstance(sample, Mapping) or not required_fields.issubset(sample):
+            raise _RawEvidenceValidationError("invalid_shape")
+        if (
+            sample.get("evidenceVersion") != 1
+            or sample.get("protocolId") != fingerprint.get("protocol")
+            or sample.get("role") != expected_role
+            or sample.get("requestedModel") != fingerprint.get("model")
+        ):
+            raise _RawEvidenceValidationError("metadata_mismatch")
+
+        cell_id = sample.get("cellId")
+        repetition = sample.get("repetitionIndex")
+        job_id = sample.get("jobId")
+        if (
+            not isinstance(cell_id, str)
+            or cell_id not in selected_cells
+            or _non_negative_integer(repetition) is None
+            or repetition >= samples_per_cell
+            or not isinstance(job_id, str)
+            or not job_id
+            or len(job_id) > 256
+        ):
+            raise _RawEvidenceValidationError("job_invalid")
+        job = (cell_id, repetition)
+        if job in observed_jobs or job_id in observed_job_ids:
+            raise _RawEvidenceValidationError("duplicate_job")
+        observed_jobs.add(job)
+        observed_job_ids.add(job_id)
+
+        category = sample.get("category")
+        normalized = sample.get("normalized")
+        normalization_candidate = sample.get("normalizationCandidate")
+        normalization_category = sample.get("normalizationCategory")
+        excluded = sample.get("excludedFromDistribution")
+        exclusion_reason = sample.get("exclusionReason")
+        error_kind = sample.get("errorKind")
+        if category not in categories or not isinstance(excluded, bool):
+            raise _RawEvidenceValidationError("sample_state_invalid")
+
+        trace_fields = sample.get("reasoningTraceFields")
+        trace_characters = _non_negative_integer(sample.get("reasoningTraceCharacterCount"))
+        if (
+            not isinstance(trace_fields, list)
+            or any(not isinstance(field, str) for field in trace_fields)
+            or len(trace_fields) != len(set(trace_fields))
+            or trace_characters is None
+            or bool(trace_fields) != (trace_characters > 0)
+        ):
+            raise _RawEvidenceValidationError("reasoning_state_invalid")
+
+        usage = sample.get("usage")
+        reasoning_tokens: int | None = None
+        if usage is not None:
+            if not isinstance(usage, Mapping) or "reasoningTokens" not in usage:
+                raise _RawEvidenceValidationError("usage_invalid")
+            raw_reasoning_tokens = usage.get("reasoningTokens")
+            if raw_reasoning_tokens is not None:
+                reasoning_tokens = _non_negative_integer(raw_reasoning_tokens)
+                if reasoning_tokens is None:
+                    raise _RawEvidenceValidationError("usage_invalid")
+        contaminated = bool(trace_fields) or (reasoning_tokens is not None and reasoning_tokens > 0)
+        if category == "valid":
+            valid_state = (
+                isinstance(normalized, str)
+                and normalization_candidate == normalized
+                and normalization_category == "valid"
+                and not excluded
+                and exclusion_reason is None
+                and error_kind is None
+                and not contaminated
+            )
+        elif category == "invalid":
+            if contaminated:
+                candidate_state = (
+                    isinstance(normalization_candidate, str)
+                    if normalization_category in {"valid", "invalid"}
+                    else normalization_candidate is None
+                )
+                valid_state = (
+                    normalized is None
+                    and normalization_category in {"valid", "invalid", "refusal", "empty"}
+                    and candidate_state
+                    and excluded
+                    and exclusion_reason == "reasoning_contamination"
+                    and error_kind is None
+                )
+            else:
+                valid_state = (
+                    isinstance(normalized, str)
+                    and normalization_candidate == normalized
+                    and normalization_category == "invalid"
+                    and not excluded
+                    and exclusion_reason is None
+                    and error_kind is None
+                )
+        elif category in {"refusal", "empty"}:
+            valid_state = (
+                normalized is None
+                and normalization_candidate is None
+                and normalization_category == category
+                and not excluded
+                and exclusion_reason is None
+                and error_kind is None
+                and not contaminated
+            )
+        else:
+            # Provider/malformed/credential errors win over reasoning contamination
+            # in the collector's category selection and remain canonical errors.
+            expected_exclusion = None if error_kind == "request_failed" else error_kind
+            valid_state = (
+                normalized is None
+                and normalization_candidate is None
+                and normalization_category is None
+                and excluded
+                and isinstance(error_kind, str)
+                and exclusion_reason == expected_exclusion
+                and (not contaminated or error_kind != "request_failed")
+            )
+        if not valid_state:
+            raise _RawEvidenceValidationError("sample_state_invalid")
+
+        summary[category] += 1
+        cell_summary = summary["cells"][cell_id]
+        cell_summary[category] += 1
+        cell_summary["total"] += 1
+        if category == "valid":
+            counts = cell_summary["counts"]
+            counts[normalized] = counts.get(normalized, 0) + 1
+        if trace_fields:
+            summary["reasoningTraceCount"] += 1
+        if reasoning_tokens is not None:
+            summary["reasoningTokenCount"] += reasoning_tokens
+        if error_kind is None:
+            summary["observableResponseSamples"] += 1
+            if reasoning_tokens is not None:
+                summary["reasoningUsageObservedSamples"] += 1
+
+    expected_jobs = {
+        (cell_id, repetition)
+        for cell_id in selected_cells
+        for repetition in range(samples_per_cell)
+    }
+    if observed_jobs != expected_jobs:
+        raise _RawEvidenceValidationError("plan_mismatch")
+
+    summary["directness"] = (
+        "violated"
+        if summary["reasoningTraceCount"] > 0 or summary["reasoningTokenCount"] > 0
+        else "unknown"
+        if summary["error"] > 0
+        or summary["reasoningUsageObservedSamples"] != summary["observableResponseSamples"]
+        else "verified"
+    )
+    return summary
+
+
+def _raw_evidence_reasons(
+    side: str,
+    raw_jsonl: object,
+    *,
+    fingerprint: Mapping[str, Any],
+    quality: Mapping[str, Any],
+    expected_role: str,
+    selected_cells: set[str],
+    samples_per_cell: int,
+) -> list[str]:
+    if not isinstance(raw_jsonl, bytes):
+        return [f"{side}_raw_evidence_missing"]
+    expected_sha = quality.get("rawEvidenceSha256")
+    if not isinstance(expected_sha, str) or not _SHA256_RE.fullmatch(expected_sha):
+        return []
+    if hashlib.sha256(raw_jsonl).hexdigest() != expected_sha:
+        return [f"{side}_raw_evidence_hash_mismatch"]
+    try:
+        rebuilt = _rebuild_raw_evidence(
+            raw_jsonl,
+            fingerprint=fingerprint,
+            expected_role=expected_role,
+            selected_cells=selected_cells,
+            samples_per_cell=samples_per_cell,
+        )
+    except _RawEvidenceValidationError as error:
+        return [f"{side}_raw_evidence_{error.reason}"]
+
+    category_names = ("valid", "invalid", "refusal", "empty", "error")
+    quality_fields = {
+        "valid": "validSamples",
+        "invalid": "invalidSamples",
+        "refusal": "refusalSamples",
+        "empty": "emptySamples",
+        "error": "errorSamples",
+    }
+    if (
+        quality.get("complete") is not True
+        or quality.get("completedSamples") != len(selected_cells) * samples_per_cell
+        or quality.get("expectedSamples") != len(selected_cells) * samples_per_cell
+        or any(
+            quality.get(field) != rebuilt[category] for category, field in quality_fields.items()
+        )
+        or quality.get("directness") != rebuilt["directness"]
+        or quality.get("reasoningTraceCount") != rebuilt["reasoningTraceCount"]
+        or quality.get("reasoningTokenCount") != rebuilt["reasoningTokenCount"]
+        or quality.get("reasoningUsageObservedSamples") != rebuilt["reasoningUsageObservedSamples"]
+    ):
+        return [f"{side}_raw_evidence_quality_aggregate_mismatch"]
+
+    cells = fingerprint.get("cells")
+    if not isinstance(cells, Mapping):
+        return [f"{side}_raw_evidence_cell_aggregate_mismatch"]
+    for cell_id in selected_cells:
+        cell = cells.get(cell_id)
+        rebuilt_cell = rebuilt["cells"][cell_id]
+        if not isinstance(cell, Mapping):
+            return [f"{side}_raw_evidence_cell_aggregate_mismatch"]
+        if (
+            any(
+                cell.get(f"{category}Count") != rebuilt_cell[category]
+                for category in category_names
+            )
+            or cell.get("totalCount") != rebuilt_cell["total"]
+        ):
+            return [f"{side}_raw_evidence_cell_aggregate_mismatch"]
+        counts = cell.get("counts")
+        if not isinstance(counts, Mapping) or dict(counts) != rebuilt_cell["counts"]:
+            return [f"{side}_raw_evidence_cell_aggregate_mismatch"]
+    return []
+
+
 def _validated_v2_evidence_reasons(
     payload: Mapping[str, Any],
     policy: ThresholdPolicy,
     scope: ComparisonScope,
+    raw_evidence_jsonl: Mapping[str, Any] | None,
 ) -> list[str]:
     """Verify operational inputs from the actual V2 evidence, not scope claims.
 
@@ -323,6 +639,17 @@ def _validated_v2_evidence_reasons(
         raw_sha = quality.get("rawEvidenceSha256")
         if not isinstance(raw_sha, str) or not _SHA256_RE.fullmatch(raw_sha):
             _append_reason(reasons, f"{side}_raw_evidence_hash_missing")
+        if policy.qualityGates.requireRawEvidence:
+            for reason in _raw_evidence_reasons(
+                side,
+                None if raw_evidence_jsonl is None else raw_evidence_jsonl.get(side),
+                fingerprint=fingerprint,
+                quality=quality,
+                expected_role=expected_role,
+                selected_cells=selected_cells,
+                samples_per_cell=expected_samples,
+            ):
+                _append_reason(reasons, reason)
 
     comparison = _comparison(payload)
     compatibility = comparison.get("compatibility")
@@ -447,6 +774,7 @@ def build_safe_decision(
     reference_metadata: Mapping[str, Any] | None = None,
     threshold_policy: ThresholdPolicy | None = None,
     comparison_scope: ComparisonScope | None = None,
+    raw_evidence_jsonl: Mapping[str, bytes] | None = None,
 ) -> dict[str, Any]:
     """Build a fail-closed operational decision from a One Token result payload.
 
@@ -461,6 +789,14 @@ def build_safe_decision(
         None
         if reference_metadata is None
         else _require_mapping(reference_metadata, "reference_metadata")
+    )
+    raw_evidence = (
+        None
+        if raw_evidence_jsonl is None
+        else _require_mapping(
+            raw_evidence_jsonl,
+            "raw_evidence_jsonl",
+        )
     )
     if threshold_policy is not None and not isinstance(threshold_policy, ThresholdPolicy):
         raise TypeError("threshold_policy must be a validated ThresholdPolicy instance")
@@ -531,10 +867,15 @@ def build_safe_decision(
             incompatible_reasons.append("reference_baseline_not_active")
 
     if policy_status == "validated":
+        assert threshold_policy is not None
+        expected_policy_sha256 = policy_sha256(threshold_policy)
+        if metadata is None or metadata.get("calibration_policy_id") != threshold_policy.id:
+            incompatible_reasons.append("reference_calibration_policy_id_mismatch")
+        if metadata is None or metadata.get("calibration_policy_sha256") != expected_policy_sha256:
+            incompatible_reasons.append("reference_calibration_policy_sha256_mismatch")
         if comparison_scope is None:
             incompatible_reasons.append("comparison_scope_missing")
         else:
-            assert threshold_policy is not None
             incompatible_reasons.extend(comparison_scope.mismatch_reasons(threshold_policy))
             incompatible_reasons.extend(
                 reason
@@ -542,6 +883,7 @@ def build_safe_decision(
                     result,
                     threshold_policy,
                     comparison_scope,
+                    raw_evidence,
                 )
                 if reason not in incompatible_reasons
             )

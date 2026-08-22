@@ -94,41 +94,30 @@ class ComparisonBatchManager:
         self._runtimes: dict[str, BatchRuntime] = {}
 
     def start(self, request: ConsoleComparisonBatchRequest) -> str:
-        for item in request.items:
-            self.evidence.fingerprint_path(item.reference_artifact_id, must_exist=True)
+        for artifact_id in dict.fromkeys(
+            item.reference_artifact_id for item in request.items
+        ):
+            self._verified_reference_path(artifact_id)
 
         batch_id = str(uuid4())
         indexed_items = list(enumerate(request.items))
         indexed_items.sort(key=lambda entry: (-entry[1].priority, entry[0]))
         runtime_items: list[BatchItemRuntime] = []
+        database_items: list[dict[str, Any]] = []
         for sequence, item in indexed_items:
             audit_id = str(uuid4())
             endpoint = item.endpoint.public_endpoint()
-            self.database.create_run(
-                audit_id=audit_id,
-                detector="one_token_verify",
-                target_base_url=str(endpoint.base_url),
-                model=endpoint.model,
-                status="queued",
-            )
-            self.database.create_comparison_record(
-                audit_id=audit_id,
-                batch_id=batch_id,
-                total_items=len(request.items),
-                station_name=item.station_name,
-                reference_artifact_id=item.reference_artifact_id,
-                reference_name=item.reference_name,
-                reference_model=item.reference_model,
-                cells=request.cells,
-                samples=request.samples,
-                concurrency=request.concurrency,
-                priority=item.priority,
-                concurrency_mode=request.concurrency_mode,
-            )
-            self.database.update_task_progress(
-                audit_id,
-                stage="queued",
-                detail=f"已进入队列 · 优先级 {item.priority}",
+            database_items.append(
+                {
+                    "audit_id": audit_id,
+                    "target_base_url": str(endpoint.base_url),
+                    "model": endpoint.model,
+                    "station_name": item.station_name,
+                    "reference_artifact_id": item.reference_artifact_id,
+                    "reference_name": item.reference_name,
+                    "reference_model": item.reference_model,
+                    "priority": item.priority,
+                }
             )
             runtime_items.append(
                 BatchItemRuntime(
@@ -139,6 +128,14 @@ class ComparisonBatchManager:
                 )
             )
 
+        self.database.create_comparison_batch_queue(
+            batch_id=batch_id,
+            items=database_items,
+            cells=request.cells,
+            samples=request.samples,
+            concurrency=request.concurrency,
+            concurrency_mode=request.concurrency_mode,
+        )
         runtime = BatchRuntime(
             batch_id=batch_id,
             request=request,
@@ -150,6 +147,25 @@ class ComparisonBatchManager:
         self._runtimes[batch_id] = runtime
         runtime.worker = asyncio.create_task(self._run(runtime))
         return batch_id
+
+    def _verified_reference_path(self, artifact_id: str) -> Path:
+        """Resolve a fingerprint only when its persisted provenance is intact."""
+
+        expected_path = self.evidence.fingerprint_path(artifact_id, must_exist=True).resolve()
+        run = self.database.get_run(artifact_id)
+        if run is None:
+            raise ValueError(f"reference audit record not found: {artifact_id}")
+        if run.status != "completed" or run.detector != "one_token_collect":
+            raise ValueError(f"reference audit is not a completed collection: {artifact_id}")
+        if not run.artifact_path or Path(run.artifact_path).resolve() != expected_path:
+            raise ValueError(
+                f"reference artifact path does not match its audit record: {artifact_id}"
+            )
+        if not run.artifact_sha256:
+            raise ValueError(f"reference artifact digest is missing: {artifact_id}")
+        if self.evidence.digest_file(expected_path) != run.artifact_sha256:
+            raise ValueError(f"reference artifact digest mismatch: {artifact_id}")
+        return expected_path
 
     async def pause(self, batch_id: str) -> None:
         runtime = self._runtime_for_active_batch(batch_id)
@@ -579,7 +595,11 @@ class ComparisonBatchManager:
                 bucket["failures"] += 1
                 continue
             try:
-                result = self.evidence.read_json(Path(run.artifact_path))
+                result = self.evidence.read_verified_json(
+                    run.artifact_path,
+                    run.artifact_sha256,
+                    expected_path=self.evidence.path_for("verification", run.id),
+                )
             except (OSError, ValueError):
                 bucket["failures"] += 1
                 continue
@@ -712,7 +732,7 @@ class ComparisonBatchManager:
                 detail=(f"正在离线比较本地参考 {index}/{len(catalog)}；不会向中转站发起新请求"),
             )
             try:
-                reference_path = self.evidence.fingerprint_path(artifact_id, must_exist=True)
+                reference_path = self._verified_reference_path(artifact_id)
                 expected_sha = catalog_item.get("artifact_sha256")
                 if expected_sha and self.evidence.digest_file(reference_path) != expected_sha:
                     raise ValueError("指纹 SHA-256 与目录记录不一致")
@@ -1062,10 +1082,7 @@ class ComparisonBatchManager:
             )
 
         try:
-            reference_path = self.evidence.fingerprint_path(
-                request.reference_artifact_id,
-                must_exist=True,
-            )
+            reference_path = self._verified_reference_path(request.reference_artifact_id)
             reference_metadata = self.database.get_reference_metadata(request.reference_artifact_id)
             target_path = self.evidence.fingerprint_path(audit_id)
             if item.preflight_started_at is None:

@@ -76,6 +76,67 @@
     return value === undefined ? "" : String(value).trim().toLowerCase();
   }
 
+  function referenceSelection(references = [], targetModel = "", preferredArtifactId = "") {
+    const preferred = String(preferredArtifactId || "").trim();
+    if (preferred) {
+      const selected = references.find((item) => item?.artifactId === preferred);
+      return {
+        artifactId: selected?.artifactId || "",
+        preferredUnavailable: !selected,
+      };
+    }
+    const exact = references.find((item) => item?.model === targetModel);
+    return {
+      artifactId: exact?.artifactId || "",
+      preferredUnavailable: false,
+    };
+  }
+
+  function mappingEnabledState(enabledIntent = false, preferredUnavailable = false) {
+    const intended = enabledIntent === true;
+    const unavailable = preferredUnavailable === true;
+    return {
+      enabledIntent: intended,
+      checked: intended && !unavailable,
+      autoDisabled: intended && unavailable,
+      userDisabled: !intended,
+    };
+  }
+
+  function mergeTargetModelMappings(existingMappings = [], discoveredModels = []) {
+    const existingByModel = new Map();
+    existingMappings.forEach((item) => {
+      const model = String(item?.model || "").trim();
+      if (model && !existingByModel.has(model)) existingByModel.set(model, { ...item, model });
+    });
+
+    const merged = [];
+    const seen = new Set();
+    discoveredModels.forEach((item) => {
+      const model = String(typeof item === "string" ? item : item?.id || item?.model || "").trim();
+      if (!model || seen.has(model)) return;
+      seen.add(model);
+      const existing = existingByModel.get(model);
+      merged.push({
+        ...(existing || {}),
+        model,
+        source: existing?.source || "discovered",
+        missingFromDiscovery: false,
+      });
+    });
+
+    existingByModel.forEach((item, model) => {
+      if (seen.has(model)) return;
+      merged.push({
+        ...item,
+        model,
+        source: item.source || "retained",
+        missingFromDiscovery: true,
+      });
+    });
+    return merged;
+  }
+
   function timestampMs(value) {
     if (value === undefined || value === null || value === "") return null;
     if (typeof value === "number" || /^\d+(?:\.\d+)?$/.test(String(value).trim())) {
@@ -661,5 +722,8 @@
     planBudgetText,
     itemOperationalState,
     itemStatusLabel,
+    referenceSelection,
+    mappingEnabledState,
+    mergeTargetModelMappings,
   });
 });

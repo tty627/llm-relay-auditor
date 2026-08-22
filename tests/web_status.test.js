@@ -3,6 +3,101 @@ const assert = require("node:assert/strict");
 
 const status = require("../src/relay_auditor/web/status.js");
 
+test("历史指定参考缺失时保持未选择且不按同名模型回退", () => {
+  const references = [
+    { artifactId: "current-artifact", model: "gpt-test" },
+    { artifactId: "other-artifact", model: "other-model" },
+  ];
+
+  assert.deepEqual(
+    status.referenceSelection(references, "gpt-test", "deleted-history-artifact"),
+    { artifactId: "", preferredUnavailable: true },
+  );
+  assert.deepEqual(
+    status.referenceSelection(references, "gpt-test", ""),
+    { artifactId: "current-artifact", preferredUnavailable: false },
+  );
+});
+
+test("参考暂不可用时自动停用但保留用户启用意图并在恢复后还原", () => {
+  assert.deepEqual(status.mappingEnabledState(true, true), {
+    enabledIntent: true,
+    checked: false,
+    autoDisabled: true,
+    userDisabled: false,
+  });
+  assert.deepEqual(status.mappingEnabledState(true, false), {
+    enabledIntent: true,
+    checked: true,
+    autoDisabled: false,
+    userDisabled: false,
+  });
+  assert.deepEqual(status.mappingEnabledState(false, false), {
+    enabledIntent: false,
+    checked: false,
+    autoDisabled: false,
+    userDisabled: true,
+  });
+});
+
+test("模型刷新合并发现结果并保留映射优先级启用状态和手工模型", () => {
+  const merged = status.mergeTargetModelMappings([
+    {
+      model: "still-listed",
+      referenceArtifactId: "artifact-1",
+      enabled: false,
+      priority: 80,
+      source: "discovered",
+    },
+    {
+      model: "manual-only",
+      referenceArtifactId: "artifact-2",
+      enabled: true,
+      priority: 20,
+      source: "manual",
+    },
+    {
+      model: "no-longer-listed",
+      referenceArtifactId: "artifact-3",
+      enabled: true,
+      priority: 50,
+      source: "discovered",
+    },
+  ], [{ id: "new-model" }, { id: "still-listed" }]);
+
+  assert.deepEqual(merged, [
+    {
+      model: "new-model",
+      source: "discovered",
+      missingFromDiscovery: false,
+    },
+    {
+      model: "still-listed",
+      referenceArtifactId: "artifact-1",
+      enabled: false,
+      priority: 80,
+      source: "discovered",
+      missingFromDiscovery: false,
+    },
+    {
+      model: "manual-only",
+      referenceArtifactId: "artifact-2",
+      enabled: true,
+      priority: 20,
+      source: "manual",
+      missingFromDiscovery: true,
+    },
+    {
+      model: "no-longer-listed",
+      referenceArtifactId: "artifact-3",
+      enabled: true,
+      priority: 50,
+      source: "discovered",
+      missingFromDiscovery: true,
+    },
+  ]);
+});
+
 test("批次状态分别统计成功失败等待重试计划阻断取消排队运行和暂停", () => {
   const counts = status.batchStateCounts([
     { status: "completed" },

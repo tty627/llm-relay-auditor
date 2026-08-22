@@ -61,10 +61,23 @@ def main() -> int:
             },
         )
 
-    if same.get("verdict") != "match" or substitute.get("verdict") != "mismatch":
+    same_result = same.get("result")
+    substitute_result = substitute.get("result")
+    expected = (
+        same.get("verdict") == "unverifiable"
+        and substitute.get("verdict") == "unverifiable"
+        and isinstance(same_result, dict)
+        and same_result.get("legacyVerdict") == "match"
+        and isinstance(substitute_result, dict)
+        and substitute_result.get("legacyVerdict") == "mismatch"
+    )
+    if not expected:
         print("演示判定未达到预期", file=sys.stderr)
         return 1
-    print("本地闭环通过：相同模型=MATCH，替换模型=MISMATCH")
+    print(
+        "本地闭环通过：operational=UNVERIFIABLE，"
+        "探索性旧结论为相同模型=MATCH、替换模型=MISMATCH"
+    )
     return 0
 
 

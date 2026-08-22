@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from relay_auditor.config import Settings
@@ -31,6 +32,26 @@ def _install_fast_batch_preflight(app, *, latency_ms: float = 1) -> None:
         }
 
     app.state.batches.preflight = fake_preflight
+
+
+def _register_reference(app, artifact_id: str, payload: dict[str, object]) -> Path:
+    path = app.state.evidence.fingerprint_path(artifact_id)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    if app.state.database.get_run(artifact_id) is None:
+        app.state.database.create_run(
+            audit_id=artifact_id,
+            detector="one_token_collect",
+            target_base_url="https://official.example/v1",
+            model=str(payload.get("model") or "reference-model"),
+        )
+    app.state.database.finish_run(
+        artifact_id,
+        status="completed",
+        verdict="recorded",
+        artifact_path=str(path),
+        artifact_sha256=app.state.evidence.digest_file(path),
+    )
+    return path
 
 
 def test_health_and_mock(tmp_path: Path) -> None:
@@ -133,6 +154,31 @@ def test_fingerprint_preflight_classifies_503_and_retry_after_as_transient() -> 
     assert calls == 1
 
 
+@pytest.mark.parametrize(
+    ("status_code", "expected_transient"),
+    [(408, True), (425, True), (500, True), (501, False), (505, False)],
+)
+def test_fingerprint_preflight_classifies_additional_http_failures(
+    status_code: int,
+    expected_transient: bool,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json={"error": {"message": "safe failure"}})
+
+    with pytest.raises(FingerprintPreflightError) as caught:
+        asyncio.run(
+            run_fingerprint_preflight(
+                EndpointSpec(base_url="https://relay.example/v1", model="model-a"),
+                api_key=None,
+                timeout_seconds=3,
+                transport=httpx.MockTransport(handler),
+            )
+        )
+
+    assert caught.value.status_code == status_code
+    assert caught.value.transient is expected_transient
+
+
 def test_fingerprint_preflight_classifies_410_as_permanent_retired_route() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -206,127 +252,41 @@ def test_browser_console_is_served_with_security_headers(tmp_path: Path) -> None
         assert 'value="unverifiable"' in history.text
 
 
-def test_console_comparison_history_is_persisted_without_key(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    secret = "sk-comparison-history-secret"
-    reference_id = "00000000-0000-0000-0000-000000000099"
-    batch_id = "00000000-0000-0000-0000-000000000088"
-    target_fingerprint = {
-        "formatVersion": 1,
-        "protocol": "one-token/v1",
-        "model": "model-a",
-        "cells": {},
-    }
-
-    async def fake_verify(self, endpoint, *, output_path, **kwargs):
-        assert kwargs["api_key"] == secret
-        output_path.write_text(json.dumps(target_fingerprint), encoding="utf-8")
-        return "match", {
-            "verdict": "match",
-            "meanJsd": 0.12,
-            "reference": {"model": "model-a"},
-            "target": {
-                "durationMs": 321,
-                "errorCount": 0,
-                "splitHalfJsd": 0.01,
-                "warnings": [],
-            },
-            "comparison": {
-                "verdict": "match",
-                "meanJsd": 0.12,
-                "comparableCellCount": 4,
-                "cells": [],
-            },
-            "warnings": [],
-        }
-
-    monkeypatch.setattr(FingerprintRunner, "verify", fake_verify)
-    database_path = tmp_path / "test.db"
-    evidence_dir = tmp_path / "evidence"
+def test_console_direct_verify_rejects_client_comparison_context(tmp_path: Path) -> None:
     settings = Settings(
-        database_url=f"sqlite:///{database_path}",
-        evidence_dir=evidence_dir,
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        evidence_dir=tmp_path / "evidence",
         fingerprint_cli_path=Path("llm-fingerprint-detector/dist/cli.js"),
     )
     app = create_app(settings)
     with TestClient(app) as client:
-        app.state.evidence.fingerprint_path(reference_id).write_text(
-            json.dumps(target_fingerprint),
-            encoding="utf-8",
-        )
         response = client.post(
             "/api/v1/console/fingerprints/verify",
             json={
                 "endpoint": {
                     "base_url": "https://relay.example/v1",
                     "model": "model-a",
-                    "api_key": secret,
                 },
-                "reference_artifact_id": reference_id,
+                "reference_artifact_id": "00000000-0000-0000-0000-000000000099",
                 "cells": 4,
                 "samples": 15,
                 "concurrency": 2,
                 "comparison_context": {
-                    "batch_id": batch_id,
-                    "total_items": 1,
+                    "batch_id": "00000000-0000-0000-0000-000000000088",
+                    "total_items": 500,
                     "station_name": "Relay A",
                     "reference_name": "Official A",
                     "reference_model": "model-a",
                 },
             },
         )
-        assert response.status_code == 200
-        response_body = response.json()
-        audit_id = response_body["audit_id"]
-        response_result = response_body["result"]
-        assert response_body["verdict"] == "unverifiable"
-        assert response_result["verdict"] == "unverifiable"
-        assert response_result["verdictSemantics"] == "operational-v1"
-        assert response_result["legacyVerdict"] == "match"
-        assert response_result["comparison"]["verdict"] == "match"
-        assert response_result["decision"]["operationalVerdict"] == "unverifiable"
-
-        run = app.state.database.get_run(audit_id)
-        assert run is not None
-        assert run.verdict == "unverifiable"
-        artifact = app.state.evidence.read_json(Path(run.artifact_path))
-        assert artifact["verdict"] == "unverifiable"
-        assert artifact["verdictSemantics"] == "operational-v1"
-        assert artifact["legacyVerdict"] == "match"
-        assert artifact["comparison"]["verdict"] == "match"
-
-        history = client.get("/api/v1/console/comparisons").json()
-        assert history["total"] == 1
-        assert history["items"][0]["station_name"] == "Relay A"
-        assert history["items"][0]["reference_artifact_id"] == reference_id
-        assert history["items"][0]["mean_jsd"] == 0.12
-        assert history["items"][0]["batch"]["status"] == "completed"
-        assert history["items"][0]["verdict"] == "unverifiable"
-        assert history["items"][0]["operational_verdict"] == "unverifiable"
-        assert history["items"][0]["legacy_verdict"] == "match"
-        assert history["items"][0]["decision_status"] == "uncalibrated"
-        assert history["items"][0]["reasons"] == ["validated_threshold_policy_missing"]
-        assert history["items"][0]["verdict_semantics"] == "operational-v1"
-        assert history["items"][0]["decision"]["decisionEligible"] is False
-
-        latest = client.get("/api/v1/console/comparisons/latest").json()
-        assert latest["batch_id"] == batch_id
-        assert latest["items"][0]["response"]["audit_id"] == audit_id
-        assert latest["items"][0]["response"]["verdict"] == "unverifiable"
-        assert latest["items"][0]["response"]["result"]["reference_artifact_id"] == reference_id
-        assert secret not in json.dumps(latest)
-
-    with TestClient(create_app(settings)) as client:
-        persisted = client.get("/api/v1/console/comparisons/latest").json()
-        assert persisted["batch_id"] == batch_id
-        assert persisted["items"][0]["station_name"] == "Relay A"
-
-    assert secret.encode() not in database_path.read_bytes()
-    assert all(
-        secret not in path.read_text(encoding="utf-8") for path in evidence_dir.rglob("*.json")
-    )
+        assert response.status_code == 422
+        assert any(
+            error["loc"][-1] == "comparison_context" and error["type"] == "extra_forbidden"
+            for error in response.json()["detail"]
+        )
+        assert client.get("/api/v1/console/comparison-batches/active").json()["batch"] is None
+        assert app.state.database.list_runs() == []
 
 
 def test_legacy_one_token_history_is_read_only_downgraded_to_unverifiable(
@@ -465,10 +425,7 @@ def test_comparison_batch_is_precreated_and_survives_browser_reload(
     app = create_app(settings)
     _install_fast_batch_preflight(app)
     with TestClient(app) as client:
-        app.state.evidence.fingerprint_path(reference_id).write_text(
-            json.dumps(target_fingerprint),
-            encoding="utf-8",
-        )
+        _register_reference(app, reference_id, target_fingerprint)
         response = client.post(
             "/api/v1/console/comparison-batches",
             json={
@@ -598,10 +555,7 @@ def test_comparison_batch_can_pause_and_resume_current_model(
     app = create_app(settings)
     _install_fast_batch_preflight(app)
     with TestClient(app) as client:
-        app.state.evidence.fingerprint_path(reference_id).write_text(
-            json.dumps(target_fingerprint),
-            encoding="utf-8",
-        )
+        _register_reference(app, reference_id, target_fingerprint)
         response = client.post(
             "/api/v1/console/comparison-batches",
             json={
@@ -904,10 +858,7 @@ def test_console_verify_preserves_target_fingerprint_after_processing_failure(
     app = create_app(settings)
     reference_id = "00000000-0000-0000-0000-000000000099"
     with TestClient(app) as client:
-        app.state.evidence.fingerprint_path(reference_id).write_text(
-            json.dumps(target),
-            encoding="utf-8",
-        )
+        _register_reference(app, reference_id, target)
         response = client.post(
             "/api/v1/console/fingerprints/verify",
             json={
@@ -988,10 +939,7 @@ def test_direct_verify_persists_operational_verdict_and_raw_evidence(
     )
     app = create_app(settings)
     with TestClient(app) as client:
-        app.state.evidence.fingerprint_path(reference_id).write_text(
-            json.dumps(fingerprint),
-            encoding="utf-8",
-        )
+        _register_reference(app, reference_id, fingerprint)
         response = client.post(
             "/api/v1/fingerprints/verify",
             json={
@@ -1073,6 +1021,7 @@ def test_endpoint_and_baseline_registry(tmp_path: Path) -> None:
         assert duplicate.status_code == 409
 
         artifact_id = "00000000-0000-0000-0000-000000000010"
+        artifact = app.state.evidence.write_json("tokenizers", artifact_id, {})
         app.state.database.create_run(
             audit_id=artifact_id,
             detector="tokenizer_collect",
@@ -1083,10 +1032,9 @@ def test_endpoint_and_baseline_registry(tmp_path: Path) -> None:
             artifact_id,
             status="completed",
             verdict="recorded",
-            artifact_path=str(tmp_path / "evidence.json"),
-            artifact_sha256="0" * 64,
+            artifact_path=str(artifact.path),
+            artifact_sha256=artifact.sha256,
         )
-        (tmp_path / "evidence.json").write_text("{}\n", encoding="utf-8")
         baseline_response = client.post(
             "/api/v1/baselines",
             json={
@@ -1105,8 +1053,7 @@ def test_endpoint_and_baseline_registry(tmp_path: Path) -> None:
         assert len(baselines.json()["items"]) == 1
 
         second_artifact_id = "00000000-0000-0000-0000-000000000011"
-        second_path = tmp_path / "evidence-2.json"
-        second_path.write_text("{}\n", encoding="utf-8")
+        second_artifact = app.state.evidence.write_json("tokenizers", second_artifact_id, {})
         app.state.database.create_run(
             audit_id=second_artifact_id,
             detector="tokenizer_collect",
@@ -1117,8 +1064,8 @@ def test_endpoint_and_baseline_registry(tmp_path: Path) -> None:
             second_artifact_id,
             status="completed",
             verdict="recorded",
-            artifact_path=str(second_path),
-            artifact_sha256="1" * 64,
+            artifact_path=str(second_artifact.path),
+            artifact_sha256=second_artifact.sha256,
         )
         replacement = client.post(
             "/api/v1/baselines",
@@ -1258,9 +1205,7 @@ def test_batch_preflight_failure_skips_sampling_and_continues(
     app = create_app(settings)
     app.state.batches.preflight = fake_preflight
     with TestClient(app) as client:
-        app.state.evidence.fingerprint_path(reference_id).write_text(
-            json.dumps(fingerprint), encoding="utf-8"
-        )
+        _register_reference(app, reference_id, fingerprint)
         created = client.post(
             "/api/v1/console/comparison-batches",
             json=_comparison_batch_payload(reference_id, ("unavailable", "healthy")),
@@ -1348,9 +1293,7 @@ def test_transient_preflight_is_cooled_down_and_requeued_behind_other_station(
     app.state.batches.preflight_retry_base_seconds = 0.01
     app.state.batches.preflight_retry_cap_seconds = 0.01
     with TestClient(app) as client:
-        app.state.evidence.fingerprint_path(reference_id).write_text(
-            json.dumps(fingerprint), encoding="utf-8"
-        )
+        _register_reference(app, reference_id, fingerprint)
         payload = _comparison_batch_payload(
             reference_id,
             ("limited", "same-station", "healthy"),
@@ -1423,9 +1366,7 @@ def test_preflight_cooldown_is_interruptible_by_batch_cancel(
     app = create_app(settings)
     app.state.batches.preflight = always_limited
     with TestClient(app) as client:
-        app.state.evidence.fingerprint_path(reference_id).write_text(
-            json.dumps(fingerprint), encoding="utf-8"
-        )
+        _register_reference(app, reference_id, fingerprint)
         created = client.post(
             "/api/v1/console/comparison-batches",
             json=_comparison_batch_payload(reference_id, ("limited",)),
@@ -1488,9 +1429,7 @@ def test_transient_preflight_stops_only_after_bounded_retry_policy(
     app.state.batches.preflight_retry_base_seconds = 0
     app.state.batches.preflight_retry_cap_seconds = 0
     with TestClient(app) as client:
-        app.state.evidence.fingerprint_path(reference_id).write_text(
-            json.dumps(fingerprint), encoding="utf-8"
-        )
+        _register_reference(app, reference_id, fingerprint)
         created = client.post(
             "/api/v1/console/comparison-batches",
             json=_comparison_batch_payload(reference_id, ("unavailable",)),
@@ -1548,9 +1487,7 @@ def test_batch_slow_plan_continues_while_progress_watchdog_is_configured(
     app = create_app(settings)
     _install_fast_batch_preflight(app, latency_ms=5000)
     with TestClient(app) as client:
-        app.state.evidence.fingerprint_path(reference_id).write_text(
-            json.dumps(fingerprint), encoding="utf-8"
-        )
+        _register_reference(app, reference_id, fingerprint)
         created = client.post(
             "/api/v1/console/comparison-batches",
             json=_comparison_batch_payload(reference_id, ("slow-model",), concurrency=2),
@@ -1600,9 +1537,7 @@ def test_sampling_retry_diagnostics_are_persisted_in_chinese(
     app = create_app(settings)
     _install_fast_batch_preflight(app)
     with TestClient(app) as client:
-        app.state.evidence.fingerprint_path(reference_id).write_text(
-            json.dumps(fingerprint), encoding="utf-8"
-        )
+        _register_reference(app, reference_id, fingerprint)
         created = client.post(
             "/api/v1/console/comparison-batches",
             json=_comparison_batch_payload(reference_id, ("retry-model",)),
@@ -1641,9 +1576,7 @@ def test_same_priority_tasks_round_robin_between_stations(
     app = create_app(settings)
     _install_fast_batch_preflight(app)
     with TestClient(app) as client:
-        app.state.evidence.fingerprint_path(reference_id).write_text(
-            json.dumps(fingerprint), encoding="utf-8"
-        )
+        _register_reference(app, reference_id, fingerprint)
         items = []
         for station, model in (
             ("Relay A", "a-1"),
@@ -1699,10 +1632,7 @@ def test_cancel_running_item_then_prioritized_queued_item_runs_next(
     app = create_app(settings)
     _install_fast_batch_preflight(app)
     with TestClient(app) as client:
-        app.state.evidence.fingerprint_path(reference_id).write_text(
-            json.dumps(fingerprint),
-            encoding="utf-8",
-        )
+        _register_reference(app, reference_id, fingerprint)
         created = client.post(
             "/api/v1/console/comparison-batches",
             json=_comparison_batch_payload(reference_id, ("first", "second", "third")),
@@ -1767,10 +1697,7 @@ def test_cancel_batch_marks_running_and_queued_items_canceled(
     app = create_app(settings)
     _install_fast_batch_preflight(app)
     with TestClient(app) as client:
-        app.state.evidence.fingerprint_path(reference_id).write_text(
-            json.dumps(fingerprint),
-            encoding="utf-8",
-        )
+        _register_reference(app, reference_id, fingerprint)
         created = client.post(
             "/api/v1/console/comparison-batches",
             json=_comparison_batch_payload(reference_id, ("first", "second", "third")),
@@ -1824,9 +1751,7 @@ def test_cancel_running_item_preserves_partial_fingerprint(
     app = create_app(settings)
     _install_fast_batch_preflight(app)
     with TestClient(app) as client:
-        app.state.evidence.fingerprint_path(reference_id).write_text(
-            json.dumps(fingerprint), encoding="utf-8"
-        )
+        _register_reference(app, reference_id, fingerprint)
         created = client.post(
             "/api/v1/console/comparison-batches",
             json=_comparison_batch_payload(reference_id, ("partial-model",)),
@@ -1885,9 +1810,7 @@ def test_queued_task_duration_starts_when_sampling_really_begins(
     app = create_app(settings)
     _install_fast_batch_preflight(app)
     with TestClient(app) as client:
-        app.state.evidence.fingerprint_path(reference_id).write_text(
-            json.dumps(fingerprint), encoding="utf-8"
-        )
+        _register_reference(app, reference_id, fingerprint)
         created = client.post(
             "/api/v1/console/comparison-batches",
             json=_comparison_batch_payload(reference_id, ("first", "second")),
@@ -1908,7 +1831,7 @@ def test_queued_task_duration_starts_when_sampling_really_begins(
     assert (second.completed_at - second.started_at).total_seconds() < 0.2
 
 
-def test_auto_concurrency_uses_two_then_trials_four_after_three_stable_runs(
+def test_auto_concurrency_ignores_tampered_history_then_trials_four(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1936,13 +1859,12 @@ def test_auto_concurrency_uses_two_then_trials_four_after_three_stable_runs(
     app = create_app(settings)
     _install_fast_batch_preflight(app)
     with TestClient(app) as client:
-        app.state.evidence.fingerprint_path(reference_id).write_text(
-            json.dumps(fingerprint),
-            encoding="utf-8",
-        )
+        _register_reference(app, reference_id, fingerprint)
         effective: list[int] = []
         reasons: list[str] = []
-        for _ in range(4):
+        first_artifact: Path | None = None
+        first_artifact_bytes: bytes | None = None
+        for _ in range(3):
             created = client.post(
                 "/api/v1/console/comparison-batches",
                 json=_comparison_batch_payload(
@@ -1958,8 +1880,55 @@ def test_auto_concurrency_uses_two_then_trials_four_after_three_stable_runs(
             options = completed["items"][0]["task_options"]
             effective.append(options["effective_concurrency"])
             reasons.append(options["concurrency_reason"])
+            if first_artifact is None:
+                run = app.state.database.get_run(completed["items"][0]["audit_id"])
+                assert run is not None and run.artifact_path
+                first_artifact = Path(run.artifact_path)
+                first_artifact_bytes = first_artifact.read_bytes()
 
-        assert selected == [2, 2, 2, 4]
+        assert first_artifact is not None and first_artifact_bytes is not None
+        first_artifact.write_text(
+            json.dumps({"target": {"errorCount": 0, "durationMs": 1}}),
+            encoding="utf-8",
+        )
+        corrupted = client.post(
+            "/api/v1/console/comparison-batches",
+            json=_comparison_batch_payload(
+                reference_id,
+                ("adaptive-model",),
+                concurrency=8,
+                concurrency_mode="auto",
+            ),
+        )
+        corrupted_completed = _wait_for_comparison_batch(
+            client,
+            corrupted.json()["batch"]["id"],
+            "completed",
+        )
+        corrupted_options = corrupted_completed["items"][0]["task_options"]
+        effective.append(corrupted_options["effective_concurrency"])
+        reasons.append(corrupted_options["concurrency_reason"])
+
+        first_artifact.write_bytes(first_artifact_bytes)
+        restored = client.post(
+            "/api/v1/console/comparison-batches",
+            json=_comparison_batch_payload(
+                reference_id,
+                ("adaptive-model",),
+                concurrency=8,
+                concurrency_mode="auto",
+            ),
+        )
+        restored_completed = _wait_for_comparison_batch(
+            client,
+            restored.json()["batch"]["id"],
+            "completed",
+        )
+        restored_options = restored_completed["items"][0]["task_options"]
+        effective.append(restored_options["effective_concurrency"])
+        reasons.append(restored_options["concurrency_reason"])
+
+        assert selected == [2, 2, 2, 1, 4]
         assert effective == selected
         assert "试探" in reasons[-1]
 
@@ -2027,10 +1996,7 @@ def test_uncertain_and_mismatch_identify_models_from_local_references_only(
     app = create_app(settings)
     _install_fast_batch_preflight(app)
     with TestClient(app) as client:
-        app.state.evidence.fingerprint_path(original_reference_id).write_text(
-            json.dumps(fingerprint),
-            encoding="utf-8",
-        )
+        _register_reference(app, original_reference_id, fingerprint)
         now = datetime.now(UTC)
         references = (
             ("00000000-0000-0000-0000-000000000211", "candidate-model", 0.01),

@@ -8,7 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from relay_auditor.evidence import EvidenceStore
-from relay_auditor.one_token_decision import build_safe_decision
+from relay_auditor.one_token_decision import build_safe_decision as _build_safe_decision
 from relay_auditor.one_token_policy import (
     POLICY_FORMAT_VERSION,
     ComparisonScope,
@@ -131,6 +131,20 @@ def valid_policy() -> ThresholdPolicy:
     return load_threshold_policy(valid_policy_payload())
 
 
+ELIGIBLE_REFERENCE.update(
+    {
+        "calibration_policy_id": POLICY_ID,
+        "calibration_policy_sha256": policy_sha256(valid_policy()),
+    }
+)
+
+
+def build_safe_decision(*args, **kwargs):
+    if args and isinstance(args[0], PolicyComparisonPayload):
+        kwargs.setdefault("raw_evidence_jsonl", args[0].raw_evidence_jsonl)
+    return _build_safe_decision(*args, **kwargs)
+
+
 def scope_payload() -> dict[str, object]:
     return {
         "methodProfileSha256": PROFILE_SHA,
@@ -156,7 +170,50 @@ def scope_payload() -> dict[str, object]:
     }
 
 
-def comparison_payload() -> dict[str, object]:
+class PolicyComparisonPayload(dict):
+    raw_evidence_jsonl: dict[str, bytes]
+
+
+def _policy_raw_sidecar(fingerprint: dict[str, object], *, role: str) -> bytes:
+    cells = fingerprint["cells"]
+    assert isinstance(cells, dict)
+    samples: list[dict[str, object]] = []
+    for cell_id in sorted(cells):
+        cell = cells[cell_id]
+        assert isinstance(cell, dict)
+        counts = cell["counts"]
+        assert isinstance(counts, dict)
+        planned = [
+            normalized for normalized, count in sorted(counts.items()) for _ in range(int(count))
+        ]
+        for repetition, normalized in enumerate(planned):
+            samples.append(
+                {
+                    "evidenceVersion": 1,
+                    "protocolId": fingerprint["protocol"],
+                    "role": role,
+                    "requestedModel": fingerprint["model"],
+                    "jobId": hashlib.sha256(f"{cell_id}\0{repetition}".encode()).hexdigest(),
+                    "cellId": cell_id,
+                    "repetitionIndex": repetition,
+                    "category": "valid",
+                    "normalized": normalized,
+                    "normalizationCandidate": normalized,
+                    "normalizationCategory": "valid",
+                    "excludedFromDistribution": False,
+                    "exclusionReason": None,
+                    "reasoningTraceFields": [],
+                    "reasoningTraceCharacterCount": 0,
+                    "usage": {"reasoningTokens": 0},
+                    "errorKind": None,
+                }
+            )
+    return "".join(
+        f"{json.dumps(sample, sort_keys=True, separators=(',', ':'))}\n" for sample in samples
+    ).encode()
+
+
+def comparison_payload() -> PolicyComparisonPayload:
     cell_ids = ["animal-random:en", "coin-flip:en"]
     cells = {
         cell_id: {
@@ -205,7 +262,7 @@ def comparison_payload() -> dict[str, object]:
             },
         }
 
-    return {
+    result: dict[str, object] = {
         "verdict": "match",
         "comparison": {
             "meanJsd": 0.0,
@@ -224,6 +281,25 @@ def comparison_payload() -> dict[str, object]:
         "target": {"fingerprint": fingerprint("audit", "a" * 64)},
         "reference": fingerprint("enrollment", "b" * 64),
     }
+    target = result["target"]
+    assert isinstance(target, dict)
+    target_fingerprint = target["fingerprint"]
+    reference_fingerprint = result["reference"]
+    assert isinstance(target_fingerprint, dict)
+    assert isinstance(reference_fingerprint, dict)
+    raw = {
+        "target": _policy_raw_sidecar(target_fingerprint, role="audit"),
+        "reference": _policy_raw_sidecar(reference_fingerprint, role="enrollment"),
+    }
+    target_quality = target_fingerprint["quality"]
+    reference_quality = reference_fingerprint["quality"]
+    assert isinstance(target_quality, dict)
+    assert isinstance(reference_quality, dict)
+    target_quality["rawEvidenceSha256"] = hashlib.sha256(raw["target"]).hexdigest()
+    reference_quality["rawEvidenceSha256"] = hashlib.sha256(raw["reference"]).hexdigest()
+    attached = PolicyComparisonPayload(result)
+    attached.raw_evidence_jsonl = raw
+    return attached
 
 
 def test_canonical_json_and_sha256_are_stable() -> None:

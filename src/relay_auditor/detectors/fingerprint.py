@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import unicodedata
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +16,9 @@ from relay_auditor.one_token_policy import ComparisonScope, ThresholdPolicy
 from relay_auditor.schemas import EndpointSpec
 
 _PAPER_PROTOCOL = "bruckner-2026-canonical40/v1"
+_CREDENTIAL_ECHO_ERROR = (
+    "One Token output contained a possible credential echo and was discarded"
+)
 _PAPER_CELL_COUNT = 40
 _PAPER_LANGUAGE_ORDER = ("en", "ru", "zh", "ar")
 _PAPER_TASK_ORDER = (
@@ -121,7 +125,6 @@ _PAPER_COLLECTION_KEYS = {
     "splitHalfComparableCells",
     "rawEvidenceSha256",
 }
-_DEFAULT_CLI_KEY_ENV_VARS = {"LLM_FINGERPRINT_API_KEY", "OPENAI_API_KEY"}
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 _PROTOCOL_CELL_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}:[a-z][a-z0-9-]{0,31}$")
@@ -234,6 +237,7 @@ def safeguard_verification_result(
     reference_metadata: dict[str, Any] | None = None,
     threshold_policy: ThresholdPolicy | None = None,
     comparison_scope: ComparisonScope | None = None,
+    raw_evidence_jsonl: dict[str, bytes] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Attach the fail-closed operational decision without losing raw CLI evidence."""
 
@@ -260,6 +264,7 @@ def safeguard_verification_result(
         reference_metadata=reference_metadata,
         threshold_policy=threshold_policy,
         comparison_scope=comparison_scope,
+        raw_evidence_jsonl=raw_evidence_jsonl,
     )
     operational_verdict = str(decision["operationalVerdict"])
     safe_payload = {
@@ -298,14 +303,30 @@ class FingerprintRunner:
             cells,
             samples,
             concurrency,
+            subcommand="fingerprint",
             api_key=api_key,
         )
-        arguments.extend(["fingerprint", "--out", str(output_path), "--json", "--quiet"])
-        return await self._execute(
-            arguments,
-            accepted_exit_codes={0},
-            environment=environment,
-        )
+        arguments.extend(["--out", str(output_path), "--json", "--quiet"])
+        try:
+            payload = await self._execute(
+                arguments,
+                accepted_exit_codes={0},
+                environment=environment,
+            )
+        except asyncio.CancelledError:
+            self._discard_credential_echo(output_path, credential=api_key)
+            raise
+        except Exception as error:
+            if self._discard_credential_echo(output_path, credential=api_key):
+                raise RuntimeError(_CREDENTIAL_ECHO_ERROR) from error
+            raise
+        if self._discard_credential_echo(
+            output_path,
+            payload=payload,
+            credential=api_key,
+        ):
+            raise RuntimeError(_CREDENTIAL_ECHO_ERROR)
+        return payload
 
     async def collect_paper_profile(
         self,
@@ -360,11 +381,11 @@ class FingerprintRunner:
         credential_arguments, environment, credential = self._credential_arguments(
             endpoint,
             api_key=api_key,
-            suppress_cli_default_keys=True,
         )
         arguments = [
             "node",
             str(self.cli_path),
+            "paper-fingerprint",
             "--base-url",
             str(endpoint.base_url).rstrip("/"),
             "--model",
@@ -380,7 +401,6 @@ class FingerprintRunner:
             str(concurrency),
             "--timeout",
             str(timeout),
-            "paper-fingerprint",
             "--out",
             str(temporary_fingerprint_path),
             "--samples-out",
@@ -494,13 +514,13 @@ class FingerprintRunner:
             cells,
             samples,
             concurrency,
+            subcommand="verify",
             api_key=api_key,
         )
         if request_timeout_ms is not None:
             arguments.extend(["--timeout", str(request_timeout_ms)])
         arguments.extend(
             [
-                "verify",
                 "--reference",
                 str(reference_path),
                 "--out",
@@ -527,6 +547,8 @@ class FingerprintRunner:
                     idle_timeout_seconds=idle_timeout_seconds,
                 )
         except FingerprintPausedError as error:
+            if self._discard_credential_echo(output_path, credential=api_key):
+                raise RuntimeError(_CREDENTIAL_ECHO_ERROR) from error
             summary = self.mark_partial_artifact(
                 output_path,
                 incomplete_reason="execution_interrupted",
@@ -534,12 +556,15 @@ class FingerprintRunner:
             error.partial_artifact = summary
             raise
         except asyncio.CancelledError:
+            self._discard_credential_echo(output_path, credential=api_key)
             self.mark_partial_artifact(
                 output_path,
                 incomplete_reason="execution_interrupted",
             )
             raise
         except FingerprintStalledError as error:
+            if self._discard_credential_echo(output_path, credential=api_key):
+                raise RuntimeError(_CREDENTIAL_ECHO_ERROR) from error
             summary = self.mark_partial_artifact(
                 output_path,
                 incomplete_reason="progress_timeout",
@@ -547,6 +572,8 @@ class FingerprintRunner:
             error.partial_artifact = summary
             raise
         except InvalidCliJsonError as error:
+            if self._discard_credential_echo(output_path, credential=api_key):
+                raise RuntimeError(_CREDENTIAL_ECHO_ERROR) from error
             try:
                 return await self._recover_verify(
                     reference_path=reference_path,
@@ -559,6 +586,16 @@ class FingerprintRunner:
                     f"{error} Offline recovery from the saved target fingerprint failed: "
                     f"{recovery_error}"
                 ) from error
+        except Exception as error:
+            if self._discard_credential_echo(output_path, credential=api_key):
+                raise RuntimeError(_CREDENTIAL_ECHO_ERROR) from error
+            raise
+        if self._discard_credential_echo(
+            output_path,
+            payload=payload,
+            credential=api_key,
+        ):
+            raise RuntimeError(_CREDENTIAL_ECHO_ERROR)
         verdict_by_exit = {0: "match", 2: "mismatch", 3: "uncertain", 4: "insufficient"}
         legacy_verdict = verdict_by_exit[exit_code]
         payload_verdict = payload.get("verdict")
@@ -1440,18 +1477,6 @@ class FingerprintRunner:
                     f"paper-fingerprint sample evidence line {line_number} "
                     "has invalid normalization candidate"
                 )
-            if category == "valid":
-                if normalized is None or sample.get("excludedFromDistribution") is not False:
-                    raise RuntimeError(
-                        f"paper-fingerprint sample evidence line {line_number} "
-                        "has invalid valid-answer state"
-                    )
-                cell_summary["counts"][normalized] = cell_summary["counts"].get(normalized, 0) + 1
-            elif normalized is not None:
-                raise RuntimeError(
-                    f"paper-fingerprint sample evidence line {line_number} "
-                    "retains an excluded answer"
-                )
             if not isinstance(sample.get("excludedFromDistribution"), bool):
                 raise RuntimeError(
                     f"paper-fingerprint sample evidence line {line_number} "
@@ -1579,30 +1604,71 @@ class FingerprintRunner:
                 and _is_non_negative_integer(usage.get("reasoningTokens"))
                 and usage["reasoningTokens"] > 0
             )
-            if contaminated:
-                contaminated_state_valid = sample.get("excludedFromDistribution") is True
-                if category == "error":
-                    contaminated_state_valid = contaminated_state_valid and sample.get(
-                        "exclusionReason"
-                    ) in {"provider_error", "malformed_response", "sensitive_credential_echo"}
-                else:
-                    contaminated_state_valid = (
-                        contaminated_state_valid
-                        and sample.get("exclusionReason") == "reasoning_contamination"
-                        and category == "invalid"
-                    )
-                if not contaminated_state_valid:
-                    raise RuntimeError(
-                        f"paper-fingerprint sample evidence line {line_number} "
-                        "retains reasoning-contaminated output"
-                    )
-            if category == "error" and (
-                sample.get("excludedFromDistribution") is not True
-                or sample.get("errorKind") is None
-            ):
-                raise RuntimeError(
-                    f"paper-fingerprint sample evidence line {line_number} has invalid error state"
+            excluded = sample["excludedFromDistribution"]
+            exclusion_reason = sample.get("exclusionReason")
+            error_kind = sample.get("errorKind")
+            if category == "valid":
+                canonical_state = (
+                    isinstance(normalized, str)
+                    and normalization_candidate == normalized
+                    and normalization_category == "valid"
+                    and excluded is False
+                    and exclusion_reason is None
+                    and error_kind is None
+                    and not contaminated
                 )
+            elif category == "invalid":
+                if contaminated:
+                    candidate_state = (
+                        isinstance(normalization_candidate, str)
+                        if normalization_category in {"valid", "invalid"}
+                        else normalization_candidate is None
+                    )
+                    canonical_state = (
+                        normalized is None
+                        and normalization_category in {"valid", "invalid", "refusal", "empty"}
+                        and candidate_state
+                        and excluded is True
+                        and exclusion_reason == "reasoning_contamination"
+                        and error_kind is None
+                    )
+                else:
+                    canonical_state = (
+                        isinstance(normalized, str)
+                        and normalization_candidate == normalized
+                        and normalization_category == "invalid"
+                        and excluded is False
+                        and exclusion_reason is None
+                        and error_kind is None
+                    )
+            elif category in {"refusal", "empty"}:
+                canonical_state = (
+                    normalized is None
+                    and normalization_candidate is None
+                    and normalization_category == category
+                    and excluded is False
+                    and exclusion_reason is None
+                    and error_kind is None
+                    and not contaminated
+                )
+            else:
+                expected_exclusion = None if error_kind == "request_failed" else error_kind
+                canonical_state = (
+                    normalized is None
+                    and normalization_candidate is None
+                    and normalization_category is None
+                    and excluded is True
+                    and error_kind is not None
+                    and exclusion_reason == expected_exclusion
+                    and (not contaminated or error_kind != "request_failed")
+                )
+            if not canonical_state:
+                raise RuntimeError(
+                    f"paper-fingerprint sample evidence line {line_number} "
+                    "has a non-canonical category/normalization/exclusion state"
+                )
+            if category == "valid":
+                cell_summary["counts"][normalized] = cell_summary["counts"].get(normalized, 0) + 1
             if sensitive_fields and (
                 category != "error"
                 or sample.get("excludedFromDistribution") is not True
@@ -1689,15 +1755,17 @@ class FingerprintRunner:
         samples: int,
         concurrency: int,
         *,
+        subcommand: str,
         api_key: str | None = None,
     ) -> tuple[list[str], dict[str, str]]:
         self.ensure_ready()
-        arguments = ["node", str(self.cli_path)]
+        if subcommand not in {"fingerprint", "verify"}:
+            raise ValueError("unsupported endpoint subcommand")
+        arguments = ["node", str(self.cli_path), subcommand]
         credential_arguments, environment, _ = self._credential_arguments(
             endpoint,
             api_key=api_key,
         )
-        # 子命令在调用方追加；其余选项可以位于子命令之后。
         common = [
             "--base-url",
             str(endpoint.base_url).rstrip("/"),
@@ -1719,28 +1787,87 @@ class FingerprintRunner:
         endpoint: EndpointSpec,
         *,
         api_key: str | None,
-        suppress_cli_default_keys: bool = False,
     ) -> tuple[list[str], dict[str, str], str | None]:
-        environment = os.environ.copy()
-        if api_key is not None:
-            if not api_key:
-                raise ValueError("api_key must not be empty")
-            ephemeral_name = f"RELAY_AUDITOR_EPHEMERAL_{uuid4().hex.upper()}"
-            environment[ephemeral_name] = api_key
-            return ["--api-key-env", ephemeral_name], environment, api_key
+        # Start from the same small environment used by offline comparison. This
+        # prevents the child CLI from silently borrowing ambient provider keys.
+        environment = FingerprintRunner._offline_environment()
+        if api_key is None:
+            return [], environment, None
+        if not api_key:
+            raise ValueError("api_key must not be empty")
 
-        if endpoint.api_key_env:
-            credential = os.environ.get(endpoint.api_key_env)
-            if not credential:
-                raise ValueError(f"environment variable is not set: {endpoint.api_key_env}")
-            return ["--api-key-env", endpoint.api_key_env], environment, credential
+        ephemeral_name = f"RELAY_AUDITOR_EPHEMERAL_{uuid4().hex.upper()}"
+        environment[ephemeral_name] = api_key
+        return ["--api-key-env", ephemeral_name], environment, api_key
 
-        if suppress_cli_default_keys:
-            # The paper path is explicit opt-in, including credential selection.
-            # Do not let the child CLI silently borrow an unrelated default key.
-            for name in _DEFAULT_CLI_KEY_ENV_VARS:
-                environment.pop(name, None)
-        return [], environment, None
+    @staticmethod
+    def _credential_variants(credential: str) -> set[str]:
+        canonical = unicodedata.normalize("NFC", credential).casefold().strip()
+        cleaned = "".join(
+            character
+            for character in canonical
+            if character.isalnum() or character.isspace()
+        )
+        digit_translation = str.maketrans(
+            "０１２３４５６７８９٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹",
+            "012345678901234567890123456789",
+        )
+        legacy_candidate = cleaned.translate(digit_translation).strip().split(maxsplit=1)[0]
+        return {variant for variant in (canonical, legacy_candidate) if variant}
+
+    @classmethod
+    def _contains_credential_echo(cls, value: Any, *, credential: str) -> bool:
+        variants = cls._credential_variants(credential)
+
+        def string_matches(candidate: str) -> bool:
+            normalized = unicodedata.normalize("NFC", candidate).casefold()
+            return any(
+                normalized == variant or (len(variant) >= 8 and variant in normalized)
+                for variant in variants
+            )
+
+        def walk(item: Any) -> bool:
+            if isinstance(item, str):
+                return string_matches(item)
+            if isinstance(item, dict):
+                return any(string_matches(str(key)) or walk(child) for key, child in item.items())
+            if isinstance(item, (list, tuple)):
+                return any(walk(child) for child in item)
+            return False
+
+        return walk(value)
+
+    @classmethod
+    def _discard_credential_echo(
+        cls,
+        output_path: Path,
+        *,
+        credential: str | None,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        if not credential:
+            return False
+        detected = payload is not None and cls._contains_credential_echo(
+            payload,
+            credential=credential,
+        )
+        if output_path.is_file():
+            try:
+                artifact_text = output_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                artifact_text = ""
+            if artifact_text:
+                try:
+                    artifact: Any = json.loads(artifact_text)
+                except json.JSONDecodeError:
+                    artifact = artifact_text
+                detected = detected or cls._contains_credential_echo(
+                    artifact,
+                    credential=credential,
+                )
+        if detected:
+            output_path.unlink(missing_ok=True)
+        return detected
 
     async def _execute(
         self,
@@ -1766,16 +1893,14 @@ class FingerprintRunner:
         cancel_event: asyncio.Event | None = None,
         idle_timeout_seconds: float | None = None,
     ) -> tuple[int, dict[str, Any]]:
-        # CLI 语法要求子命令紧跟程序名，把调用方追加的子命令移到索引 2。
-        command = arguments[:2]
-        subcommand_index = next(
-            index
-            for index, value in enumerate(arguments[2:], start=2)
-            if value in {"compare", "fingerprint", "paper-fingerprint", "verify"}
-        )
-        command.append(arguments[subcommand_index])
-        command.extend(arguments[2:subcommand_index])
-        command.extend(arguments[subcommand_index + 1 :])
+        if len(arguments) < 3 or arguments[2] not in {
+            "compare",
+            "fingerprint",
+            "paper-fingerprint",
+            "verify",
+        }:
+            raise ValueError("CLI subcommand must be explicit at argument index 2")
+        command = list(arguments)
 
         if idle_timeout_seconds is not None and idle_timeout_seconds <= 0:
             raise ValueError("idle_timeout_seconds must be greater than zero")

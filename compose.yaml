@@ -21,8 +21,9 @@ services:
       AUDITOR_DATABASE_URL: postgresql+psycopg://auditor:local-only-change-me@postgres:5432/relay_auditor
       AUDITOR_EVIDENCE_DIR: /app/data/evidence
       AUDITOR_FINGERPRINT_CLI_PATH: /app/llm-fingerprint-detector/dist/cli.js
+      AUDITOR_ACCESS_TOKEN: ${AUDITOR_ACCESS_TOKEN:?set AUDITOR_ACCESS_TOKEN to a random value}
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     depends_on:
       postgres:
         condition: service_healthy
