@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,10 @@ _EVIDENCE_EXTENSIONS = {
 class Artifact:
     path: Path
     sha256: str
+
+
+class EvidenceIntegrityError(ValueError):
+    """Stored evidence no longer matches its registered path or digest."""
 
 
 class EvidenceStore:
@@ -80,6 +85,71 @@ class EvidenceStore:
         if not isinstance(payload, dict):
             raise ValueError(f"evidence must contain a JSON object: {path}")
         return payload
+
+    def read_verified_bytes(
+        self,
+        registered_path: str | Path | None,
+        registered_sha256: str | None,
+        *,
+        expected_path: Path | None = None,
+    ) -> tuple[Path, bytes]:
+        """Read once, then validate the registered location and digest."""
+
+        if not registered_path:
+            raise EvidenceIntegrityError("evidence path is not registered")
+        if not registered_sha256:
+            raise EvidenceIntegrityError("evidence SHA-256 is not registered")
+        artifact_path = Path(registered_path).resolve()
+        if self.root not in artifact_path.parents:
+            raise EvidenceIntegrityError("evidence path escapes the evidence root")
+        if expected_path is not None and artifact_path != expected_path.resolve():
+            raise EvidenceIntegrityError("evidence path does not match its canonical artifact path")
+        try:
+            encoded = artifact_path.read_bytes()
+        except FileNotFoundError:
+            raise FileNotFoundError(f"evidence file is missing: {artifact_path}") from None
+        actual_sha256 = hashlib.sha256(encoded).hexdigest()
+        if not hmac.compare_digest(actual_sha256, registered_sha256.lower()):
+            raise EvidenceIntegrityError("evidence SHA-256 does not match the registered digest")
+        return artifact_path, encoded
+
+    def read_verified_json(
+        self,
+        registered_path: str | Path | None,
+        registered_sha256: str | None,
+        *,
+        expected_path: Path | None = None,
+    ) -> dict[str, Any]:
+        artifact_path, encoded = self.read_verified_bytes(
+            registered_path,
+            registered_sha256,
+            expected_path=expected_path,
+        )
+        try:
+            payload = json.loads(encoded)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise EvidenceIntegrityError(
+                f"evidence is not valid UTF-8 JSON: {artifact_path}"
+            ) from error
+        if not isinstance(payload, dict):
+            raise EvidenceIntegrityError(
+                f"evidence must contain a JSON object: {artifact_path}"
+            )
+        return payload
+
+    def verify_registered_path(
+        self,
+        registered_path: str | Path | None,
+        registered_sha256: str | None,
+        *,
+        expected_path: Path | None = None,
+    ) -> Path:
+        artifact_path, _ = self.read_verified_bytes(
+            registered_path,
+            registered_sha256,
+            expected_path=expected_path,
+        )
+        return artifact_path
 
     @staticmethod
     def digest_file(path: Path) -> str:

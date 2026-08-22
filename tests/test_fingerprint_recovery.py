@@ -51,6 +51,202 @@ def comparison_payload(*, verdict: str = "uncertain") -> dict:
     }
 
 
+def test_child_credential_environment_is_minimal_and_explicit(monkeypatch) -> None:
+    ambient_default = "sk-ambient-default"
+    selected_secret = "sk-selected-but-not-resolved"
+    explicit_secret = "sk-explicit"
+    monkeypatch.setenv("OPENAI_API_KEY", ambient_default)
+    monkeypatch.setenv("LLM_FINGERPRINT_API_KEY", ambient_default)
+    monkeypatch.setenv("RELAY_SELECTED_KEY", selected_secret)
+    endpoint = EndpointSpec(
+        base_url="https://relay.example/v1",
+        model="model-a",
+        api_key_env="RELAY_SELECTED_KEY",
+    )
+
+    with pytest.raises(ValueError, match="must be resolved by the service"):
+        FingerprintRunner._credential_arguments(
+            endpoint,
+            api_key=None,
+        )
+
+    arguments, environment, credential = FingerprintRunner._credential_arguments(
+        endpoint,
+        api_key=explicit_secret,
+    )
+    assert arguments[0] == "--api-key-env"
+    ephemeral_name = arguments[1]
+    assert ephemeral_name.startswith("RELAY_AUDITOR_EPHEMERAL_")
+    assert environment == {
+        **FingerprintRunner._offline_environment(),
+        ephemeral_name: explicit_secret,
+    }
+    assert ambient_default not in environment.values()
+    assert selected_secret not in environment.values()
+    assert credential == explicit_secret
+
+
+async def test_collect_discards_legacy_normalized_credential_echo(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cli_path = tmp_path / "cli.js"
+    cli_path.write_text("// test stub\n", encoding="utf-8")
+    output_path = tmp_path / "fingerprint.json"
+    runner = FingerprintRunner(cli_path)
+    secret = "sk-live-credentialecho"
+    normalized_secret = "sklivecredentialecho"
+    fingerprint = {
+        **write_fingerprint(output_path, model="target-model"),
+        "cells": {
+            "random-color:en": {
+                "counts": {normalized_secret: 1},
+            }
+        },
+    }
+    output_path.write_text(json.dumps(fingerprint), encoding="utf-8")
+
+    async def fake_execute(*args, **kwargs):
+        return {"fingerprint": fingerprint, "run": {}}
+
+    monkeypatch.setattr(runner, "_execute", fake_execute)
+    with pytest.raises(RuntimeError) as caught:
+        await runner.collect(
+            EndpointSpec(base_url="https://relay.example/v1", model="target-model"),
+            output_path=output_path,
+            cells=4,
+            samples=15,
+            concurrency=2,
+            api_key=secret,
+        )
+
+    assert str(caught.value) == (
+        "One Token output was rejected because it contained a possible credential echo"
+    )
+    assert secret not in str(caught.value)
+    assert normalized_secret not in str(caught.value)
+    assert not output_path.exists()
+
+
+async def test_verify_discards_successful_credential_echo_artifact(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cli_path = tmp_path / "cli.js"
+    cli_path.write_text("// test stub\n", encoding="utf-8")
+    reference_path = tmp_path / "reference.json"
+    target_path = tmp_path / "target.json"
+    write_fingerprint(reference_path, model="reference-model")
+    runner = FingerprintRunner(cli_path)
+    secret = "Secret-Word"
+    normalized_secret = "secretword"
+    target = {
+        **write_fingerprint(target_path, model="target-model"),
+        "cells": {"random-word:en": {"counts": {normalized_secret: 1}}},
+    }
+    target_path.write_text(json.dumps(target), encoding="utf-8")
+    payload = {
+        "verdict": "match",
+        "comparison": {"verdict": "match"},
+        "target": {"fingerprint": target},
+    }
+
+    async def fake_execute(*args, **kwargs):
+        return 0, payload
+
+    monkeypatch.setattr(runner, "_execute_with_code", fake_execute)
+    with pytest.raises(RuntimeError, match="possible credential echo") as caught:
+        await runner.verify(
+            EndpointSpec(base_url="https://relay.example/v1", model="target-model"),
+            reference_path=reference_path,
+            output_path=target_path,
+            cells=4,
+            samples=15,
+            concurrency=2,
+            api_key=secret,
+        )
+
+    assert secret not in str(caught.value)
+    assert normalized_secret not in str(caught.value)
+    assert not target_path.exists()
+
+
+async def test_verify_discards_partial_credential_echo_checkpoint(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cli_path = tmp_path / "cli.js"
+    cli_path.write_text("// test stub\n", encoding="utf-8")
+    reference_path = tmp_path / "reference.json"
+    target_path = tmp_path / "target.json"
+    write_fingerprint(reference_path, model="reference-model")
+    runner = FingerprintRunner(cli_path)
+    secret = "sk-partial-credentialecho"
+    normalized_secret = "skpartialcredentialecho"
+
+    async def fake_execute(*args, **kwargs):
+        partial = {
+            **write_fingerprint(target_path, model="target-model"),
+            "partial": True,
+            "completedSamples": 1,
+            "expectedSamples": 60,
+            "errorCount": 0,
+            "incompleteReason": "sampling_in_progress",
+            "cells": {"random-color:en": {"counts": {normalized_secret: 1}}},
+        }
+        target_path.write_text(json.dumps(partial), encoding="utf-8")
+        raise FingerprintPausedError("paused")
+
+    monkeypatch.setattr(runner, "_execute_with_code", fake_execute)
+    with pytest.raises(RuntimeError, match="possible credential echo") as caught:
+        await runner.verify(
+            EndpointSpec(base_url="https://relay.example/v1", model="target-model"),
+            reference_path=reference_path,
+            output_path=target_path,
+            cells=4,
+            samples=15,
+            concurrency=2,
+            api_key=secret,
+            progress_callback=lambda event: None,
+            cancel_event=asyncio.Event(),
+        )
+
+    assert secret not in str(caught.value)
+    assert normalized_secret not in str(caught.value)
+    assert not target_path.exists()
+
+
+@pytest.mark.parametrize("model", ["verify", "fingerprint", "compare", "paper-fingerprint"])
+async def test_model_id_cannot_be_mistaken_for_cli_subcommand(
+    tmp_path: Path,
+    monkeypatch,
+    model: str,
+) -> None:
+    cli_path = tmp_path / "cli.js"
+    cli_path.write_text("// test stub\n", encoding="utf-8")
+    runner = FingerprintRunner(cli_path)
+    captured: dict[str, object] = {}
+
+    async def fake_execute(arguments, *, accepted_exit_codes, environment):
+        captured["arguments"] = arguments
+        return {}
+
+    monkeypatch.setattr(runner, "_execute", fake_execute)
+    await runner.collect(
+        EndpointSpec(base_url="https://relay.example/v1", model=model),
+        output_path=tmp_path / "fingerprint.json",
+        cells=4,
+        samples=15,
+        concurrency=2,
+    )
+
+    arguments = captured["arguments"]
+    assert isinstance(arguments, list)
+    assert arguments[2] == "fingerprint"
+    model_index = arguments.index("--model") + 1
+    assert arguments[model_index] == model
+
+
 def test_parse_jsonl_progress_preserves_safe_error_state() -> None:
     event = FingerprintRunner._parse_progress_line(
         'LLMFP_PROGRESS {"stage":"sampling","done":7,"total":40,'
@@ -611,8 +807,9 @@ async def test_recover_failed_verification_creates_new_audit_without_network(
         evidence.fingerprint_path(failed_audit_id),
         model="gpt-5.6-terra",
     )
+    reference_path = evidence.fingerprint_path(reference_artifact_id)
     write_fingerprint(
-        evidence.fingerprint_path(reference_artifact_id),
+        reference_path,
         model="gpt-5.6-terra",
     )
     database.create_run(
@@ -628,6 +825,19 @@ async def test_recover_failed_verification_creates_new_audit_without_network(
         artifact_path=str(evidence.fingerprint_path(failed_audit_id)),
         artifact_sha256=evidence.digest_file(evidence.fingerprint_path(failed_audit_id)),
         error_message="One Token CLI returned invalid JSON",
+    )
+    database.create_run(
+        audit_id=reference_artifact_id,
+        detector="one_token_collect",
+        target_base_url="https://official.example/v1",
+        model="gpt-5.6-terra",
+    )
+    database.finish_run(
+        reference_artifact_id,
+        status="completed",
+        verdict="recorded",
+        artifact_path=str(reference_path),
+        artifact_sha256=evidence.digest_file(reference_path),
     )
 
     async def fake_execute(self, arguments, *, accepted_exit_codes, environment):

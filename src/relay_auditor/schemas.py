@@ -1,14 +1,14 @@
 from typing import Any, Literal
 
-from pydantic import AnyHttpUrl, BaseModel, Field, SecretStr, field_validator
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 
 def reject_url_userinfo(value: AnyHttpUrl) -> AnyHttpUrl:
-    """API base URLs are endpoints, never a credential transport."""
+    """API base URLs are origins/paths, never a credential transport."""
 
     if value.username is not None or value.password is not None:
         raise ValueError("base_url must not contain username or password credentials")
-    if value.query is not None or value.fragment is not None:
+    if value.query or value.fragment:
         raise ValueError("base_url must not contain query parameters or fragments")
     return value
 
@@ -72,21 +72,6 @@ class ConsoleFingerprintCollectRequest(BaseModel):
     concurrency: int = Field(default=4, ge=1, le=20)
 
 
-class ConsoleComparisonContext(BaseModel):
-    batch_id: str
-    total_items: int = Field(ge=1, le=500)
-    station_name: str = Field(min_length=1, max_length=80)
-    reference_name: str = Field(min_length=1, max_length=100)
-    reference_model: str = Field(min_length=1, max_length=255)
-
-    @field_validator("batch_id")
-    @classmethod
-    def validate_batch_id(cls, value: str) -> str:
-        if not value or any(char not in "0123456789abcdef-" for char in value):
-            raise ValueError("batch_id must be a lowercase UUID")
-        return value
-
-
 class ConsoleComparisonBatchItemRequest(BaseModel):
     endpoint: EphemeralEndpointSpec
     reference_artifact_id: str
@@ -114,8 +99,9 @@ class ConsoleComparisonBatchRequest(BaseModel):
 
 
 class ConsoleFingerprintVerifyRequest(ConsoleFingerprintCollectRequest):
+    model_config = ConfigDict(extra="forbid")
+
     reference_artifact_id: str
-    comparison_context: ConsoleComparisonContext | None = None
 
     @field_validator("reference_artifact_id")
     @classmethod

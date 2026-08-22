@@ -145,38 +145,77 @@ def compare_tokenizer_fingerprints(
     reference: dict[str, Any],
     target: dict[str, Any],
 ) -> dict[str, Any]:
-    reference_vector = reference.get("slope_vector")
-    target_vector = target.get("slope_vector")
-    if not isinstance(reference_vector, dict) or not isinstance(target_vector, dict):
-        raise ValueError("tokenizer evidence is missing slope_vector")
-    probe_ids = sorted(set(reference_vector) & set(target_vector))
-    if not probe_ids:
-        raise ValueError("tokenizer evidence has no comparable probes")
+    expected_probe_ids = set(PROBE_UNITS)
+
+    def validated_side(
+        fingerprint: dict[str, Any],
+        *,
+        label: str,
+    ) -> tuple[dict[str, float], list[str]]:
+        if fingerprint.get("protocol") != "tokenizer-slope/v1":
+            raise ValueError(f"{label} tokenizer evidence has an unsupported protocol")
+        raw_vector = fingerprint.get("slope_vector")
+        if not isinstance(raw_vector, dict):
+            raise ValueError(f"{label} tokenizer evidence is missing slope_vector")
+        if set(raw_vector) != expected_probe_ids:
+            raise ValueError(f"{label} tokenizer evidence does not contain the complete probe set")
+        vector: dict[str, float] = {}
+        for probe_id in sorted(expected_probe_ids):
+            value = raw_vector[probe_id]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                raise ValueError(
+                    f"{label} tokenizer slope for {probe_id} must be a finite non-negative number"
+                )
+            vector[probe_id] = float(value)
+
+        raw_unstable = fingerprint.get("unstable_probes")
+        if not isinstance(raw_unstable, list):
+            raise ValueError(f"{label} tokenizer evidence is missing unstable_probes")
+        if (
+            any(not isinstance(probe_id, str) for probe_id in raw_unstable)
+            or len(raw_unstable) != len(set(raw_unstable))
+            or not set(raw_unstable).issubset(expected_probe_ids)
+        ):
+            raise ValueError(f"{label} tokenizer evidence has invalid unstable_probes")
+        return vector, sorted(raw_unstable)
+
+    reference_vector, reference_unstable = validated_side(reference, label="reference")
+    target_vector, target_unstable = validated_side(target, label="target")
+    probe_ids = sorted(expected_probe_ids)
 
     absolute_deltas = {
-        probe_id: abs(float(target_vector[probe_id]) - float(reference_vector[probe_id]))
+        probe_id: abs(target_vector[probe_id] - reference_vector[probe_id])
         for probe_id in probe_ids
     }
-    denominator = sum(max(abs(float(reference_vector[probe_id])), 1.0) for probe_id in probe_ids)
+    denominator = sum(max(abs(reference_vector[probe_id]), 1.0) for probe_id in probe_ids)
     normalized_l1 = sum(absolute_deltas.values()) / denominator
-    unstable = sorted(set(target.get("unstable_probes") or []))
 
-    if normalized_l1 > 0.10:
-        verdict = "mismatch"
-    elif unstable:
-        verdict = "unstable"
+    if reference_unstable or target_unstable:
+        exploratory_verdict = "unstable"
+    elif normalized_l1 > 0.10:
+        exploratory_verdict = "mismatch"
     elif normalized_l1 > 0.03:
-        verdict = "uncertain"
+        exploratory_verdict = "uncertain"
     else:
-        verdict = "match"
+        exploratory_verdict = "match"
 
     return {
-        "verdict": verdict,
+        "verdict": exploratory_verdict,
+        "exploratory_verdict": exploratory_verdict,
+        "operational_verdict": "unverifiable",
+        "verdict_semantics": "exploratory-uncalibrated",
+        "decision_eligible": False,
         "normalized_l1": round(normalized_l1, 6),
         "thresholds": {"match_max": 0.03, "uncertain_max": 0.10},
         "threshold_source": "engineering_default_pending_official_calibration",
         "absolute_slope_deltas": absolute_deltas,
         "reference_slope_vector": reference_vector,
         "target_slope_vector": target_vector,
-        "target_unstable_probes": unstable,
+        "reference_unstable_probes": reference_unstable,
+        "target_unstable_probes": target_unstable,
     }

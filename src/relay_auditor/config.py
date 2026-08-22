@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     request_timeout_seconds: float = 30.0
     allowed_api_key_envs: str = ""
     api_key_base_url_bindings: str = "{}"
+    access_token: SecretStr | None = None
     management_token: SecretStr | None = None
 
     model_config = SettingsConfigDict(
@@ -119,26 +120,33 @@ class Settings(BaseSettings):
             )
 
     def management_token_value(self) -> str | None:
-        if self.management_token is None:
-            return None
-        value = self.management_token.get_secret_value()
-        return value if value else None
+        if self.management_token is not None:
+            value = self.management_token.get_secret_value()
+            return value if value else None
+        return self.reveal_access_token()
 
     def validate_managed_credential_configuration(self) -> None:
         names = self.api_key_env_allowlist()
         bindings = self.api_key_base_url_bindings_map()
+        token = self.management_token_value()
+        if names and token is None and not bindings:
+            # An allowlist alone is inert. Keep the service usable in explicitly
+            # disabled mode so operators can configure the token and bindings
+            # together without exposing any credential in the interim.
+            return
         missing = sorted(names - bindings.keys())
         if missing:
             raise ValueError(
                 "every allowed API key environment variable needs a Base URL binding"
             )
-        if names:
-            token = self.management_token_value()
-            if token is None or re.fullmatch(r"[A-Za-z0-9._~-]{24,512}", token) is None:
-                raise ValueError(
-                    "AUDITOR_MANAGEMENT_TOKEN must contain 24-512 URL-safe ASCII "
-                    "characters when managed API credentials are enabled"
-                )
+        if names and (
+            token is None or re.fullmatch(r"[A-Za-z0-9._~-]{24,512}", token) is None
+        ):
+            raise ValueError(
+                "AUDITOR_MANAGEMENT_TOKEN or AUDITOR_ACCESS_TOKEN must contain "
+                "24-512 URL-safe ASCII characters when managed API credentials "
+                "are enabled"
+            )
         for name, base_urls in bindings.items():
             for base_url in base_urls:
                 self.require_api_key_base_url_binding(name, base_url)
@@ -151,3 +159,6 @@ class Settings(BaseSettings):
         if value is None or not value.strip():
             raise ValueError("the allowed api_key_env is not set in the service environment")
         return value.strip()
+
+    def reveal_access_token(self) -> str | None:
+        return self.access_token.get_secret_value() if self.access_token is not None else None

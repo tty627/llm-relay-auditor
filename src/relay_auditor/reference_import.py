@@ -9,7 +9,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 from sqlalchemy import select, update
 
-from relay_auditor.database import AuditRun, Baseline, Database, ManagedEndpoint
+from relay_auditor.database import AuditRun, Baseline, Database
 from relay_auditor.evidence import EvidenceStore
 
 IMPORT_NAMESPACE = uuid5(
@@ -206,7 +206,6 @@ def import_reference_directory(
         endpoint_name = _bounded_endpoint_name(reference_prefix, source_label, model)
         expires_at = collected_at + timedelta(days=valid_days)
         now = datetime.now(UTC)
-        baseline_status = "active" if expires_at >= now else "expired"
         relative_name = relative.as_posix()
         per_item_overlay = dict(item_metadata.get(relative_name, {}))
         sample_metadata = _sample_metadata(payload)
@@ -239,32 +238,19 @@ def import_reference_directory(
         }
 
         with database.sessions() as session:
-            endpoint = session.scalar(
-                select(ManagedEndpoint).where(ManagedEndpoint.name == endpoint_name)
+            endpoint = database.upsert_endpoint_in_session(
+                session,
+                endpoint_id=endpoint_id,
+                name=endpoint_name,
+                provider=provider,
+                base_url=normalized_base_url,
+                model=model,
+                protocol="openai_chat",
+                now=now,
+                reuse_by_connection_identity=False,
             )
-            if endpoint is None:
-                endpoint = ManagedEndpoint(
-                    id=endpoint_id,
-                    name=endpoint_name,
-                    provider=provider,
-                    base_url=normalized_base_url,
-                    model=model,
-                    protocol="openai_chat",
-                    api_key_env=None,
-                    enabled=True,
-                    created_at=now,
-                    updated_at=now,
-                )
-                session.add(endpoint)
-            else:
-                endpoint_id = endpoint.id
-                endpoint.provider = provider
-                endpoint.base_url = normalized_base_url
-                endpoint.model = model
-                endpoint.protocol = "openai_chat"
-                endpoint.api_key_env = None
-                endpoint.enabled = True
-                endpoint.updated_at = now
+            session.flush()
+            endpoint_id = endpoint.id
 
             run = session.get(AuditRun, artifact_id)
             if run is None:
@@ -300,18 +286,44 @@ def import_reference_directory(
                     Baseline.endpoint_id == endpoint_id,
                     Baseline.detector == "one_token",
                     Baseline.status == "active",
-                    Baseline.id != baseline_id,
+                    Baseline.expires_at < now,
                 )
-                .values(status="superseded")
+                .values(status="expired")
+            )
+            active_baseline = session.scalar(
+                select(Baseline)
+                .where(
+                    Baseline.endpoint_id == endpoint_id,
+                    Baseline.detector == "one_token",
+                    Baseline.status == "active",
+                )
+                .order_by(Baseline.valid_from.desc(), Baseline.created_at.desc())
+                .limit(1)
             )
             baseline = session.get(Baseline, baseline_id)
+            if expires_at < now:
+                desired_status = "expired"
+            elif baseline is not None and baseline.status == "deleted":
+                desired_status = "deleted"
+            elif active_baseline is None or active_baseline.id == baseline_id:
+                desired_status = "active"
+            elif collected_at > (
+                active_baseline.valid_from
+                if active_baseline.valid_from.tzinfo is not None
+                else active_baseline.valid_from.replace(tzinfo=UTC)
+            ):
+                active_baseline.status = "superseded"
+                desired_status = "active"
+            else:
+                desired_status = "superseded"
+
             if baseline is None:
                 baseline = Baseline(
                     id=baseline_id,
                     endpoint_id=endpoint_id,
                     detector="one_token",
                     artifact_id=artifact_id,
-                    status=baseline_status,
+                    status=desired_status,
                     valid_from=collected_at,
                     expires_at=expires_at,
                     metadata_json=metadata,
@@ -322,7 +334,7 @@ def import_reference_directory(
                 baseline.endpoint_id = endpoint_id
                 baseline.detector = "one_token"
                 baseline.artifact_id = artifact_id
-                baseline.status = baseline_status
+                baseline.status = desired_status
                 baseline.valid_from = collected_at
                 baseline.expires_at = expires_at
                 baseline.metadata_json = metadata
@@ -336,7 +348,7 @@ def import_reference_directory(
                 artifact_id=artifact_id,
                 endpoint_id=endpoint_id,
                 baseline_id=baseline_id,
-                status=baseline_status,
+                status=desired_status,
             )
         )
 

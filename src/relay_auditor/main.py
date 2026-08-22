@@ -1,5 +1,8 @@
+import base64
+import binascii
 import hashlib
-import hmac
+import ipaddress
+import secrets
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -8,7 +11,9 @@ from urllib.parse import urlparse
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request, Response, Security
-from fastapi.responses import FileResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import IntegrityError
@@ -28,7 +33,7 @@ from relay_auditor.detectors.tokenizer import (
     collect_tokenizer_fingerprint,
     compare_tokenizer_fingerprints,
 )
-from relay_auditor.evidence import EvidenceStore
+from relay_auditor.evidence import EvidenceIntegrityError, EvidenceStore
 from relay_auditor.mock_api import router as mock_router
 from relay_auditor.schemas import (
     AuditResponse,
@@ -87,13 +92,165 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         auto_error=False,
     )
 
+    @app.exception_handler(RequestValidationError)
+    async def redact_request_validation_error(
+        _: Request,
+        error: RequestValidationError,
+    ) -> JSONResponse:
+        errors: list[dict[str, Any]] = []
+        for item in error.errors():
+            sanitized = dict(item)
+            if "input" in sanitized:
+                # Validation failures may contain whole nested request objects,
+                # misspelled credential fields, or URL-embedded secrets. The
+                # location/message is sufficient for clients to correct input;
+                # never reflect submitted values into responses or proxy logs.
+                sanitized["input"] = "[REDACTED]"
+            errors.append(sanitized)
+        return JSONResponse(
+            status_code=422,
+            content={"detail": jsonable_encoder(errors)},
+        )
+
+    def is_local_client(request: Request) -> bool:
+        if request.client is None:
+            return False
+        client_host = request.client.host
+        if client_host == "testclient":
+            return True
+        try:
+            return ipaddress.ip_address(client_host).is_loopback
+        except ValueError:
+            return False
+
+    def has_valid_access_token(request: Request) -> bool:
+        expected = configured.reveal_access_token()
+        if not expected:
+            return False
+        authorization = request.headers.get("authorization", "")
+        scheme, _, encoded = authorization.partition(" ")
+        if scheme.lower() == "bearer":
+            return secrets.compare_digest(encoded, expected)
+        if scheme.lower() != "basic":
+            return False
+        try:
+            decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+            username, password = decoded.split(":", 1)
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            return False
+        return username == "auditor" and secrets.compare_digest(password, expected)
+
+    def has_valid_management_token(presented: str | None) -> bool:
+        expected = configured.management_token_value()
+        return bool(
+            expected is not None
+            and presented is not None
+            and secrets.compare_digest(presented, expected)
+        )
+
+    def require_managed_credential_access(
+        request: Request,
+        presented_management_token: str | None,
+    ) -> None:
+        if has_valid_access_token(request) or has_valid_management_token(
+            presented_management_token
+        ):
+            return
+        if configured.management_token_value() is None:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "server-managed credentials are disabled until "
+                    "AUDITOR_MANAGEMENT_TOKEN or AUDITOR_ACCESS_TOKEN is configured"
+                ),
+            )
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "valid X-Relay-Auditor-Token or server access credentials are required "
+                "for managed credentials"
+            ),
+        )
+
+    def endpoint_response_payload(
+        endpoint_payload: dict[str, Any],
+        *,
+        authenticated: bool,
+    ) -> dict[str, Any]:
+        item = dict(endpoint_payload)
+        credential_configured = item.get("api_key_env") is not None
+        if credential_configured and not authenticated:
+            item["api_key_env"] = None
+        item["credential_configured"] = credential_configured
+        return item
+
+    def same_origin(request: Request, origin: str) -> bool:
+        try:
+            parsed = urlparse(origin)
+            if (
+                parsed.scheme not in {"http", "https"}
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.path not in {"", "/"}
+                or parsed.params
+                or parsed.query
+                or parsed.fragment
+            ):
+                return False
+            origin_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            request_port = request.url.port or (443 if request.url.scheme == "https" else 80)
+            return (
+                parsed.hostname == request.url.hostname
+                and origin_port == request_port
+                and parsed.scheme == request.url.scheme
+            )
+        except ValueError:
+            return False
+
     @app.middleware("http")
     async def disable_console_api_caching(request: Request, call_next):
+        local_client = is_local_client(request)
+        authenticated = has_valid_access_token(request)
+        if request.url.path != "/health" and not (local_client or authenticated):
+            token_configured = bool(configured.reveal_access_token())
+            return JSONResponse(
+                status_code=401 if token_configured else 403,
+                content={
+                    "detail": (
+                        "valid local access credentials are required"
+                        if token_configured
+                        else "non-local access is disabled until AUDITOR_ACCESS_TOKEN is set"
+                    )
+                },
+                headers=(
+                    {"WWW-Authenticate": 'Basic realm="Relay Auditor"'}
+                    if token_configured
+                    else None
+                ),
+            )
+        is_console_api = request.url.path.startswith("/api/v1/console/")
+        is_api = request.url.path.startswith("/api/v1/")
+        allowed_hosts = {"127.0.0.1", "localhost", "::1", "testserver"}
+        request_host = request.url.hostname
+        if request.url.path != "/health" and (
+            (local_client and not authenticated and request_host not in allowed_hosts)
+            or (is_console_api and request_host not in allowed_hosts)
+        ):
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "unauthenticated local access requires a local Host"},
+            )
+        origin = request.headers.get("origin")
+        if is_api and origin and not same_origin(request, origin):
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "API origin is not allowed"},
+            )
         response = await call_next(request)
-        if request.url.path.startswith("/api/v1/console/") or request.headers.get(
-            "x-relay-auditor-token"
-        ) is not None:
+        if is_console_api or request.headers.get("x-relay-auditor-token") is not None:
             response.headers["Cache-Control"] = "no-store"
+        if is_console_api:
+            response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
         return response
 
     web_dir = Path(__file__).parent / "web"
@@ -111,36 +268,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "X-Content-Type-Options": "nosniff",
         }
 
-    def redact_error(error: Exception, api_key: str | None) -> str:
-        detail = str(error)
-        if api_key:
-            detail = detail.replace(api_key, "[REDACTED]")
-        return detail
-
-    def require_management_token(presented: str | None) -> None:
-        expected = configured.management_token_value()
-        if expected is None:
-            raise HTTPException(
-                status_code=503,
-                detail="managed credential access is not configured",
-            )
-        valid = presented is not None and hmac.compare_digest(
-            presented.encode("utf-8"),
-            expected.encode("ascii"),
-        )
-        if not valid:
-            raise HTTPException(
-                status_code=401,
-                detail="valid X-Relay-Auditor-Token header required",
-            )
-
-    def resolve_managed_api_key(endpoint: Any, presented_token: str | None) -> str | None:
-        """Resolve only explicitly allowed credentials bound to this endpoint tuple."""
-
+    def resolve_managed_api_key(
+        endpoint: Any,
+        request: Request,
+        presented_management_token: str | None = None,
+    ) -> str | None:
         try:
             if endpoint.api_key_env is None:
                 return None
-            require_management_token(presented_token)
+            require_managed_credential_access(request, presented_management_token)
             configured.require_api_key_base_url_binding(
                 endpoint.api_key_env,
                 str(endpoint.base_url),
@@ -161,6 +297,108 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except (ValueError, RuntimeError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
+    def verified_reference_path(
+        artifact_id: str,
+        *,
+        category: str,
+        detector: str,
+    ) -> Path:
+        run = database.get_run(artifact_id)
+        if run is None or run.status != "completed":
+            raise FileNotFoundError(f"completed reference artifact not found: {artifact_id}")
+        if run.detector != detector:
+            raise EvidenceIntegrityError("reference artifact detector does not match")
+        return evidence.verify_registered_path(
+            run.artifact_path,
+            run.artifact_sha256,
+            expected_path=evidence.path_for(category, artifact_id),
+        )
+
+    def expected_run_artifact_path(run: Any) -> Path | None:
+        category: str | None
+        if run.detector == "smoke":
+            category = "smoke"
+        elif run.detector == "one_token_collect":
+            category = "fingerprints"
+        elif run.detector == "one_token_verify":
+            category = "verification" if run.status == "completed" else "fingerprints"
+        elif run.detector == "one_token_recovered":
+            category = "verification"
+        elif run.detector == "tokenizer_collect":
+            category = "tokenizers"
+        elif run.detector == "tokenizer_verify":
+            category = "tokenizer_verification"
+        else:
+            category = None
+        return evidence.path_for(category, run.id) if category else None
+
+    def read_run_result(run: Any) -> tuple[dict[str, Any] | None, str]:
+        if not run.artifact_path:
+            return None, "missing"
+        try:
+            return (
+                evidence.read_verified_json(
+                    run.artifact_path,
+                    run.artifact_sha256,
+                    expected_path=expected_run_artifact_path(run),
+                ),
+                "verified",
+            )
+        except FileNotFoundError:
+            return None, "missing"
+        except (EvidenceIntegrityError, OSError):
+            return None, "corrupt"
+
+    def audit_run_item(run: Any) -> dict[str, Any]:
+        item = run.as_dict()
+        result, integrity = read_run_result(run)
+        item["evidence_integrity"] = integrity
+        if (
+            run.detector
+            not in {"one_token_verify", "one_token_recovered", "tokenizer_verify"}
+            or run.status != "completed"
+        ):
+            return item
+        is_tokenizer = run.detector == "tokenizer_verify"
+        decision = result.get("decision") if result else None
+        operational = decision.get("operationalVerdict") if isinstance(decision, dict) else None
+        if (
+            isinstance(operational, str)
+            and operational
+            and (not is_tokenizer or operational == "unverifiable")
+        ):
+            item["verdict"] = operational
+            item["verdict_semantics"] = "operational-v1"
+            return item
+        legacy_values = {"match", "uncertain", "mismatch", "unstable"}
+        legacy = run.verdict if run.verdict in legacy_values else None
+        status = "legacy_uncalibrated" if is_tokenizer else "legacy_unmigrated"
+        reason = (
+            "legacy_tokenizer_result_without_calibrated_policy"
+            if is_tokenizer
+            else "legacy_result_without_safe_decision"
+        )
+        decision = {
+            "operationalVerdict": "unverifiable",
+            "status": status,
+            "reasons": [reason],
+            "legacyVerdict": legacy,
+            "decisionEligible": False,
+        }
+        if is_tokenizer:
+            decision["exploratoryVerdict"] = legacy
+        item.update(
+            {
+                "verdict": "unverifiable",
+                "legacy_verdict": legacy,
+                "verdict_semantics": (
+                    "legacy-uncalibrated" if is_tokenizer else "legacy-unmigrated"
+                ),
+                "decision": decision,
+            }
+        )
+        return item
+
     @app.get("/", include_in_schema=False)
     async def console() -> FileResponse:
         return FileResponse(
@@ -179,15 +417,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/v1/audits")
     async def list_audits(limit: int = 50) -> dict[str, Any]:
         safe_limit = min(max(limit, 1), 200)
-        return {"items": [run.as_dict() for run in database.list_runs(safe_limit)]}
+        return {"items": [audit_run_item(run) for run in database.list_runs(safe_limit)]}
 
     @app.post("/api/v1/endpoints", status_code=201)
     async def create_endpoint(
         payload: ManagedEndpointCreateRequest,
+        request: Request,
         management_token: Annotated[str | None, Security(management_token_header)],
     ) -> dict[str, object]:
         if payload.api_key_env is not None:
-            require_management_token(management_token)
+            require_managed_credential_access(request, management_token)
         try:
             configured.require_api_key_base_url_binding(
                 payload.api_key_env,
@@ -202,20 +441,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 protocol=payload.protocol,
                 api_key_env=payload.api_key_env,
             )
-        except (ValueError, RuntimeError) as error:
+        except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         except IntegrityError as error:
             raise HTTPException(status_code=409, detail="endpoint name already exists") from error
         return endpoint.as_dict()
 
     @app.get("/api/v1/endpoints")
-    async def list_endpoints() -> dict[str, object]:
-        return {"items": [endpoint.as_dict() for endpoint in database.list_endpoints()]}
+    async def list_endpoints(request: Request) -> dict[str, object]:
+        authenticated = has_valid_access_token(request) or has_valid_management_token(
+            request.headers.get("x-relay-auditor-token")
+        )
+        items = [
+            endpoint_response_payload(
+                endpoint.as_dict(),
+                authenticated=authenticated,
+            )
+            for endpoint in database.list_endpoints()
+        ]
+        return {"items": items}
 
     @app.post("/api/v1/endpoints/{endpoint_id}/models")
     async def discover_managed_endpoint_models(
         endpoint_id: str,
         response: Response,
+        request: Request,
         management_token: Annotated[str | None, Security(management_token_header)],
     ) -> dict[str, Any]:
         """Discover models without accepting a plaintext credential in the request."""
@@ -231,7 +481,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             model=managed.model,
             api_key_env=managed.api_key_env,
         )
-        api_key = resolve_managed_api_key(endpoint, management_token)
+        api_key = resolve_managed_api_key(endpoint, request, management_token)
         try:
             result = await discover_models(
                 EphemeralConnectionSpec(base_url=managed.base_url),
@@ -266,8 +516,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             run.target_base_url
         ) != normalize_fingerprint_base_url(endpoint.base_url):
             raise HTTPException(status_code=409, detail="artifact endpoint does not match baseline")
-        if not run.artifact_path or not Path(run.artifact_path).is_file():
-            raise HTTPException(status_code=409, detail="artifact evidence file is missing")
+        category = {"one_token": "fingerprints", "tokenizer": "tokenizers"}[
+            payload.detector
+        ]
+        try:
+            evidence.verify_registered_path(
+                run.artifact_path,
+                run.artifact_sha256,
+                expected_path=evidence.path_for(category, payload.artifact_id),
+            )
+        except (FileNotFoundError, EvidenceIntegrityError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
         valid_from = datetime.now(UTC)
         baseline = database.create_baseline(
             baseline_id=str(uuid4()),
@@ -287,9 +546,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/v1/audits/smoke", response_model=AuditResponse)
     async def smoke_audit(
         payload: SmokeAuditRequest,
+        request: Request,
         management_token: Annotated[str | None, Security(management_token_header)],
     ) -> AuditResponse:
-        api_key = resolve_managed_api_key(payload.target, management_token)
+        api_key = resolve_managed_api_key(payload.target, request, management_token)
         audit_id = str(uuid4())
         database.create_run(
             audit_id=audit_id,
@@ -334,9 +594,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/v1/fingerprints/collect", response_model=AuditResponse)
     async def collect_fingerprint(
         payload: FingerprintCollectRequest,
+        request: Request,
         management_token: Annotated[str | None, Security(management_token_header)],
     ) -> AuditResponse:
-        api_key = resolve_managed_api_key(payload.endpoint, management_token)
+        api_key = resolve_managed_api_key(payload.endpoint, request, management_token)
         audit_id = str(uuid4())
         database.create_run(
             audit_id=audit_id,
@@ -384,9 +645,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/v1/fingerprints/verify", response_model=AuditResponse)
     async def verify_fingerprint(
         payload: FingerprintVerifyRequest,
+        request: Request,
         management_token: Annotated[str | None, Security(management_token_header)],
     ) -> AuditResponse:
-        api_key = resolve_managed_api_key(payload.endpoint, management_token)
+        api_key = resolve_managed_api_key(payload.endpoint, request, management_token)
         audit_id = str(uuid4())
         target_path: Path | None = None
         database.create_run(
@@ -396,9 +658,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             model=payload.endpoint.model,
         )
         try:
-            reference_path = evidence.fingerprint_path(
+            reference_path = verified_reference_path(
                 payload.reference_artifact_id,
-                must_exist=True,
+                category="fingerprints",
+                detector="one_token_collect",
             )
             reference_metadata = database.get_reference_metadata(payload.reference_artifact_id)
             target_path = evidence.fingerprint_path(audit_id)
@@ -442,6 +705,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 error_message=detail,
             )
             raise HTTPException(status_code=404, detail=detail) from error
+        except EvidenceIntegrityError as error:
+            detail = redact_error(error, api_key)
+            database.finish_run(
+                audit_id,
+                status="failed",
+                verdict="error",
+                error_message=detail,
+            )
+            raise HTTPException(status_code=409, detail=detail) from error
         except Exception as error:
             detail = redact_error(error, api_key)
             partial_path = str(target_path) if target_path and target_path.is_file() else None
@@ -458,16 +730,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             raise HTTPException(status_code=502, detail=detail) from error
 
-    def read_comparison_result(run: Any) -> dict[str, Any] | None:
-        if not run.artifact_path:
-            return None
-        artifact_path = Path(run.artifact_path).resolve()
-        if evidence.root not in artifact_path.parents or not artifact_path.is_file():
-            return None
-        try:
-            return evidence.read_json(artifact_path)
-        except (OSError, ValueError):
-            return None
+    def redact_error(error: Exception, api_key: str | None) -> str:
+        detail = str(error)
+        if api_key:
+            detail = detail.replace(api_key, "[REDACTED]")
+        return detail
 
     def comparison_item(
         row: tuple[Any, Any, Any],
@@ -475,7 +742,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         include_result: bool = False,
     ) -> dict[str, Any]:
         run, record, batch = row
-        result = read_comparison_result(run)
+        result, artifact_integrity = read_run_result(run)
         comparison = result.get("comparison", {}) if result else {}
         target = result.get("target", {}) if result else {}
         reference = result.get("reference", {}) if result else {}
@@ -549,7 +816,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             }
         preflight = execution.get("preflight") if isinstance(execution, dict) else None
         partial_evidence = bool(result and result.get("partial") is True)
-        if result is None:
+        if artifact_integrity == "corrupt":
+            evidence_state = "corrupt"
+        elif result is None:
             evidence_state = "none"
         elif partial_evidence:
             evidence_state = "partial"
@@ -600,6 +869,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "artifact_sha256": run.artifact_sha256,
             "evidence_available": result is not None,
             "evidence_state": evidence_state,
+            "evidence_integrity": artifact_integrity,
             "partial_evidence": partial_evidence,
             "partial_sample_count": (
                 result.get("completedSamples") if partial_evidence and result else None
@@ -740,6 +1010,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             batch_id = batches.start(payload)
         except FileNotFoundError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
         return comparison_batch_payload(batch_id)
 
     @app.get("/api/v1/console/comparison-batches/active")
@@ -829,15 +1101,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=502, detail=detail) from error
 
     @app.get("/api/v1/console/references")
-    async def console_list_references(include_inactive: bool = False) -> dict[str, Any]:
+    async def console_list_references(
+        request: Request,
+        include_inactive: bool = False,
+    ) -> dict[str, Any]:
         items = database.list_reference_catalog(active_only=not include_inactive)
         for item in items:
+            endpoint_payload = item.get("endpoint")
+            if isinstance(endpoint_payload, dict):
+                item["endpoint"] = endpoint_response_payload(
+                    endpoint_payload,
+                    authenticated=(
+                        has_valid_access_token(request)
+                        or has_valid_management_token(
+                            request.headers.get("x-relay-auditor-token")
+                        )
+                    ),
+                )
             baseline = item["baseline"]
             if isinstance(baseline, dict):
                 run = database.get_run(str(baseline["artifact_id"]))
-                item["evidence_available"] = bool(
-                    run and run.artifact_path and Path(run.artifact_path).is_file()
-                )
+                try:
+                    if run is None:
+                        raise FileNotFoundError
+                    category = (
+                        "tokenizers" if baseline.get("detector") == "tokenizer" else "fingerprints"
+                    )
+                    evidence.verify_registered_path(
+                        run.artifact_path,
+                        run.artifact_sha256,
+                        expected_path=evidence.path_for(category, run.id),
+                    )
+                    item["evidence_available"] = True
+                    item["evidence_integrity"] = "verified"
+                except FileNotFoundError:
+                    item["evidence_available"] = False
+                    item["evidence_integrity"] = "missing"
+                except EvidenceIntegrityError:
+                    item["evidence_available"] = False
+                    item["evidence_integrity"] = "corrupt"
         return {"items": items}
 
     @app.delete("/api/v1/console/references/{baseline_id}")
@@ -857,20 +1159,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
 
     @app.get("/api/v1/console/evidence/{artifact_id}", include_in_schema=False)
-    async def console_download_evidence(artifact_id: str) -> FileResponse:
+    async def console_download_evidence(artifact_id: str) -> Response:
         run = database.get_run(artifact_id)
         if run is None or not run.artifact_path:
             raise HTTPException(status_code=404, detail="audit evidence not found")
-        artifact_path = Path(run.artifact_path).resolve()
-        if evidence.root not in artifact_path.parents or not artifact_path.is_file():
-            raise HTTPException(status_code=404, detail="audit evidence file is missing")
-        return FileResponse(
-            artifact_path,
+        try:
+            _, encoded = evidence.read_verified_bytes(
+                run.artifact_path,
+                run.artifact_sha256,
+                expected_path=expected_run_artifact_path(run),
+            )
+        except FileNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except EvidenceIntegrityError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return Response(
+            content=encoded,
             media_type="application/json",
-            filename=f"{run.detector}-{artifact_id}.json",
             headers={
                 "Cache-Control": "no-store",
                 "X-Evidence-SHA256": run.artifact_sha256 or "",
+                "Content-Disposition": (
+                    f'attachment; filename="{run.detector}-{artifact_id}.json"'
+                ),
             },
         )
 
@@ -1002,23 +1313,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             model=endpoint.model,
         )
         try:
-            context = payload.comparison_context
-            if context is not None:
-                database.create_comparison_record(
-                    audit_id=audit_id,
-                    batch_id=context.batch_id,
-                    total_items=context.total_items,
-                    station_name=context.station_name,
-                    reference_artifact_id=payload.reference_artifact_id,
-                    reference_name=context.reference_name,
-                    reference_model=context.reference_model,
-                    cells=payload.cells,
-                    samples=payload.samples,
-                    concurrency=payload.concurrency,
-                )
-            reference_path = evidence.fingerprint_path(
+            reference_path = verified_reference_path(
                 payload.reference_artifact_id,
-                must_exist=True,
+                category="fingerprints",
+                detector="one_token_collect",
             )
             reference_metadata = database.get_reference_metadata(payload.reference_artifact_id)
             target_path = evidence.fingerprint_path(audit_id)
@@ -1048,7 +1346,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 artifact_path=str(artifact.path),
                 artifact_sha256=artifact.sha256,
             )
-            database.finish_comparison_record(audit_id)
             return AuditResponse(
                 audit_id=audit_id,
                 detector="one_token_verify",
@@ -1066,8 +1363,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 verdict="error",
                 error_message=detail,
             )
-            database.finish_comparison_record(audit_id)
             raise HTTPException(status_code=404, detail=detail) from error
+        except EvidenceIntegrityError as error:
+            detail = redact_error(error, api_key)
+            database.finish_run(
+                audit_id,
+                status="failed",
+                verdict="error",
+                error_message=detail,
+            )
+            raise HTTPException(status_code=409, detail=detail) from error
         except Exception as error:
             detail = redact_error(error, api_key)
             partial_path = str(target_path) if target_path and target_path.is_file() else None
@@ -1082,15 +1387,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 artifact_sha256=partial_sha,
                 error_message=detail,
             )
-            database.finish_comparison_record(audit_id)
             raise HTTPException(status_code=502, detail=detail) from error
 
     @app.post("/api/v1/tokenizers/collect", response_model=AuditResponse)
     async def collect_tokenizer(
         payload: TokenizerCollectRequest,
+        request: Request,
         management_token: Annotated[str | None, Security(management_token_header)],
     ) -> AuditResponse:
-        api_key = resolve_managed_api_key(payload.endpoint, management_token)
+        api_key = resolve_managed_api_key(payload.endpoint, request, management_token)
         audit_id = str(uuid4())
         database.create_run(
             audit_id=audit_id,
@@ -1136,9 +1441,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/v1/tokenizers/verify", response_model=AuditResponse)
     async def verify_tokenizer(
         payload: TokenizerVerifyRequest,
+        request: Request,
         management_token: Annotated[str | None, Security(management_token_header)],
     ) -> AuditResponse:
-        api_key = resolve_managed_api_key(payload.endpoint, management_token)
+        api_key = resolve_managed_api_key(payload.endpoint, request, management_token)
         audit_id = str(uuid4())
         database.create_run(
             audit_id=audit_id,
@@ -1147,9 +1453,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             model=payload.endpoint.model,
         )
         try:
-            reference_path = evidence.tokenizer_path(
+            reference_path = verified_reference_path(
                 payload.reference_artifact_id,
-                must_exist=True,
+                category="tokenizers",
+                detector="tokenizer_collect",
             )
             reference = evidence.read_json(reference_path)
             target = await collect_tokenizer_fingerprint(
@@ -1160,10 +1467,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 api_key=api_key,
             )
             comparison = compare_tokenizer_fingerprints(reference, target)
-            result = {"reference_artifact_id": payload.reference_artifact_id, "target": target}
-            result["comparison"] = comparison
+            exploratory_verdict = str(comparison["verdict"])
+            decision = {
+                "operationalVerdict": "unverifiable",
+                "status": "uncalibrated",
+                "reasons": ["validated_tokenizer_threshold_policy_missing"],
+                "exploratoryVerdict": exploratory_verdict,
+                "normalizedL1": comparison.get("normalized_l1"),
+                "decisionEligible": False,
+            }
+            result = {
+                "reference_artifact_id": payload.reference_artifact_id,
+                "target": target,
+                "comparison": comparison,
+                "exploratoryVerdict": exploratory_verdict,
+                "verdict": "unverifiable",
+                "verdictSemantics": "operational-v1",
+                "decision": decision,
+            }
             artifact = evidence.write_json("tokenizer_verification", audit_id, result)
-            verdict = str(comparison["verdict"])
+            verdict = "unverifiable"
             database.finish_run(
                 audit_id,
                 status="completed",
@@ -1189,6 +1512,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 error_message=detail,
             )
             raise HTTPException(status_code=404, detail=detail) from error
+        except EvidenceIntegrityError as error:
+            detail = redact_error(error, api_key)
+            database.finish_run(
+                audit_id,
+                status="failed",
+                verdict="error",
+                error_message=detail,
+            )
+            raise HTTPException(status_code=409, detail=detail) from error
         except Exception as error:
             detail = redact_error(error, api_key)
             database.finish_run(

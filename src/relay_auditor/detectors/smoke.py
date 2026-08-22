@@ -1,3 +1,5 @@
+import re
+import unicodedata
 from time import perf_counter
 from typing import Any
 
@@ -6,6 +8,34 @@ import httpx
 from relay_auditor.detectors.preflight import normalize_fingerprint_base_url
 from relay_auditor.schemas import EndpointSpec
 from relay_auditor.secret_safety import reject_secret_echo
+
+
+def _redact_api_key_echo(value: Any, api_key: str | None) -> Any:
+    """Recursively remove an explicitly supplied credential from untrusted fields."""
+
+    if not api_key:
+        return value
+    if isinstance(value, str):
+        normalized_key = unicodedata.normalize("NFC", api_key)
+        normalized_value = unicodedata.normalize("NFC", value)
+        if normalized_key.casefold() not in normalized_value.casefold():
+            return value
+        redacted = re.sub(
+            re.escape(normalized_key),
+            "[REDACTED]",
+            normalized_value,
+            flags=re.IGNORECASE,
+        )
+        return redacted if redacted != normalized_value else "[REDACTED]"
+    if isinstance(value, list):
+        return [_redact_api_key_echo(item, api_key) for item in value]
+    if isinstance(value, dict):
+        redacted: dict[Any, Any] = {}
+        for key, item in value.items():
+            safe_key = _redact_api_key_echo(key, api_key) if isinstance(key, str) else key
+            redacted[safe_key] = _redact_api_key_echo(item, api_key)
+        return redacted
+    return value
 
 
 async def run_smoke(
@@ -34,12 +64,15 @@ async def run_smoke(
         "max_tokens": 16,
     }
     started = perf_counter()
-    async with httpx.AsyncClient(
-        timeout=timeout_seconds,
-        transport=transport,
-        follow_redirects=False,
-    ) as client:
-        response = await client.post(url, headers=headers, json=payload)
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout_seconds,
+            transport=transport,
+            follow_redirects=False,
+        ) as client:
+            response = await client.post(url, headers=headers, json=payload)
+    except httpx.HTTPError as error:
+        raise RuntimeError(f"Smoke request failed: {error.__class__.__name__}") from None
     latency_ms = round((perf_counter() - started) * 1000, 2)
 
     response_json: dict[str, Any]
@@ -61,18 +94,20 @@ async def run_smoke(
     result = {
         "verdict": "pass" if passed else "fail",
         "request": {
-            "url": url,
-            "model": endpoint.model,
-            "prompt": prompt,
-            "api_key_env": endpoint.api_key_env,
+            "url": _redact_api_key_echo(url, credential),
+            "model": _redact_api_key_echo(endpoint.model, credential),
+            "prompt": _redact_api_key_echo(prompt, credential),
+            "api_key_env": _redact_api_key_echo(endpoint.api_key_env, credential),
         },
         "response": {
             "status_code": response.status_code,
             "latency_ms": latency_ms,
-            "model": response_json.get("model"),
-            "usage": response_json.get("usage"),
+            "model": _redact_api_key_echo(response_json.get("model"), credential),
+            "usage": _redact_api_key_echo(response_json.get("usage"), credential),
             "has_content": has_content,
-            "request_id": response.headers.get("x-request-id"),
+            "request_id": _redact_api_key_echo(
+                response.headers.get("x-request-id"), credential
+            ),
         },
     }
     reject_secret_echo(result, credential, source="smoke response")

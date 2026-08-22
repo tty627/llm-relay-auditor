@@ -1,4 +1,6 @@
 import math
+import re
+import unicodedata
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from ipaddress import ip_address
@@ -94,6 +96,34 @@ def _extract_content(message: object) -> str:
     return ""
 
 
+def _redact_api_key_echo(value: Any, api_key: str | None) -> Any:
+    """Recursively remove an explicitly supplied credential from untrusted fields."""
+
+    if not api_key:
+        return value
+    if isinstance(value, str):
+        normalized_key = unicodedata.normalize("NFC", api_key)
+        normalized_value = unicodedata.normalize("NFC", value)
+        if normalized_key.casefold() not in normalized_value.casefold():
+            return value
+        redacted = re.sub(
+            re.escape(normalized_key),
+            "[REDACTED]",
+            normalized_value,
+            flags=re.IGNORECASE,
+        )
+        return redacted if redacted != normalized_value else "[REDACTED]"
+    if isinstance(value, list):
+        return [_redact_api_key_echo(item, api_key) for item in value]
+    if isinstance(value, dict):
+        redacted: dict[Any, Any] = {}
+        for key, item in value.items():
+            safe_key = _redact_api_key_echo(key, api_key) if isinstance(key, str) else key
+            redacted[safe_key] = _redact_api_key_echo(item, api_key)
+        return redacted
+    return value
+
+
 def _safe_error_message(response: httpx.Response, api_key: str | None) -> str | None:
     try:
         payload = response.json()
@@ -105,10 +135,8 @@ def _safe_error_message(response: httpx.Response, api_key: str | None) -> str | 
     message = error.get("message") if isinstance(error, dict) else None
     if not isinstance(message, str) or not message.strip():
         return None
-    safe = " ".join(message.split())[:240]
-    if api_key:
-        safe = safe.replace(api_key, "[REDACTED]")
-    return safe
+    redacted = _redact_api_key_echo(message, api_key)
+    return " ".join(redacted.split())[:240]
 
 
 def retry_after_seconds(response: httpx.Response) -> float | None:
@@ -133,6 +161,14 @@ def retry_after_seconds(response: httpx.Response) -> float | None:
     if seconds < 0:
         return 0.0
     return seconds
+
+
+def _is_transient_http_status(status_code: int) -> bool:
+    """Classify retryable response codes without retrying unsupported gateways."""
+
+    if status_code in {408, 425, 429}:
+        return True
+    return 500 <= status_code < 600 and status_code not in {501, 505}
 
 
 async def run_fingerprint_preflight(
@@ -196,18 +232,18 @@ async def run_fingerprint_preflight(
                 request_started = perf_counter()
                 response = await client.post(url, headers=headers, json=base_payload)
                 latency_ms = round((perf_counter() - request_started) * 1000, 2)
-    except httpx.TimeoutException as error:
+    except httpx.TimeoutException:
         raise FingerprintPreflightError(
             f"预检超时：{timeout_seconds:g} 秒内没有收到中转站响应；未开始正式采样",
             transient=True,
             error_kind="timeout",
-        ) from error
+        ) from None
     except httpx.HTTPError as error:
         raise FingerprintPreflightError(
             f"预检网络失败：{error.__class__.__name__}；未开始正式采样",
             transient=True,
             error_kind="network",
-        ) from error
+        ) from None
 
     total_latency_ms = round((perf_counter() - started) * 1000, 2)
     if not response.is_success:
@@ -223,7 +259,7 @@ async def run_fingerprint_preflight(
         explanation = explanation or "请求参数或接口不兼容"
         remote_message = _safe_error_message(response, credential)
         suffix = f" · {remote_message}" if remote_message else ""
-        transient = status_code in {429, 502, 503, 504}
+        transient = _is_transient_http_status(status_code)
         raise FingerprintPreflightError(
             f"预检失败：HTTP {status_code}，{explanation}{suffix}；未开始正式采样",
             transient=transient,
@@ -256,4 +292,5 @@ async def run_fingerprint_preflight(
         "totalLatencyMs": total_latency_ms,
     }
     reject_secret_echo(result, credential, source="fingerprint preflight response")
+    result["requestId"] = _redact_api_key_echo(result["requestId"], credential)
     return result

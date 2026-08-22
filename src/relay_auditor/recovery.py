@@ -37,8 +37,23 @@ async def recover_failed_verification(
     if failed_run.detector != "one_token_verify" or failed_run.status != "failed":
         raise ValueError("source audit must be a failed one_token_verify run")
 
-    target_path = evidence.fingerprint_path(failed_audit_id, must_exist=True)
-    reference_path = evidence.fingerprint_path(reference_artifact_id, must_exist=True)
+    target_path = evidence.verify_registered_path(
+        failed_run.artifact_path,
+        failed_run.artifact_sha256,
+        expected_path=evidence.fingerprint_path(failed_audit_id),
+    )
+    reference_run = database.get_run(reference_artifact_id)
+    if (
+        reference_run is None
+        or reference_run.status != "completed"
+        or reference_run.detector != "one_token_collect"
+    ):
+        raise LookupError(f"completed reference audit not found: {reference_artifact_id}")
+    reference_path = evidence.verify_registered_path(
+        reference_run.artifact_path,
+        reference_run.artifact_sha256,
+        expected_path=evidence.fingerprint_path(reference_artifact_id),
+    )
     reference_metadata = database.get_reference_metadata(reference_artifact_id)
     verdict, payload = await runner.recover_verify(
         reference_path=reference_path,

@@ -64,7 +64,7 @@ uvicorn relay_auditor.main:app --reload
 
 默认表单已填入本地 Mock，可在不使用真实 Key 的情况下验证完整交互。模型发现要求端点兼容 `GET /models`，采样要求兼容 `POST /chat/completions`；任一接口不兼容时仍可手动填写模型 ID。不同供应商的原生 Responses/Messages 协议尚未接入此页面。
 
-浏览器输入的 Key 只发送给本机 `/api/v1/console/*` 接口，并通过该任务独立的子进程环境传给采样器；不会进入命令行参数、数据库、证据文件或浏览器持久存储。页面不要通过公网地址访问，服务应继续绑定 `127.0.0.1`。关闭页面前可以点击“清空全部 Key”。
+浏览器输入的 Key 只发送给本机 `/api/v1/console/*` 接口，并通过该任务独立的子进程环境传给采样器；不会进入命令行参数、数据库、证据文件或浏览器持久存储。控制台 API 会拒绝非本机 Host 和跨 Origin 请求，Compose 也只发布到 `127.0.0.1`。页面不要通过公网地址访问。关闭页面前可以点击“清空全部 Key”。
 
 刷新页面会保留工作区配置、完整批次队列、实时进度、优先顺序、已完成结果和历史记录；正在执行的批次由本机服务继续处理，刷新页面不会终止任务。任务支持暂停、继续、取消和排队项置顶；暂停当前模型时会安全停止采样，继续后从该模型重新采集。为了坚持 Key 不落盘，只有本机服务进程重启才会清除运行中批次的临时 Key，并把未完成条目标记为“已中断”，此时需要重新提交这些模型。
 
@@ -92,7 +92,7 @@ python scripts/demo_local.py
 python scripts/demo_tokenizer.py
 ```
 
-预期结果：Mock 中同 Tokenizer 为 `match`，替换模型为 `mismatch`，`mixed-20` 因重复计数变化或斜率偏移被识别为 `unstable/mismatch`。这些确定性场景只验证检测链路是否按设计工作，不构成真实模型准确率或阈值的测量。
+预期结果：顶层 operational verdict 均为 `unverifiable`；探索性结果中，同 Tokenizer 为 `match`，替换模型为 `mismatch`，`mixed-20` 因重复计数变化或斜率偏移被识别为 `unstable/mismatch`。这些确定性场景只验证检测链路是否按设计工作，不构成真实模型准确率或阈值的测量。
 
 按实施计划运行 10 组同模型和 5 组已知替换校准：
 
@@ -108,10 +108,16 @@ python scripts/calibrate_mock.py
 
 ```bash
 git submodule update --init --recursive
+export AUDITOR_ACCESS_TOKEN="$(openssl rand -hex 32)"
+export AUDITOR_MANAGEMENT_TOKEN="$AUDITOR_ACCESS_TOKEN"
 docker compose up --build
 ```
 
-Compose 使用 PostgreSQL 保存审计记录；这组凭据只供本地开发，生产部署必须替换并通过密钥管理系统注入。
+Compose 使用 PostgreSQL 保存审计记录，并要求显式设置随机访问令牌。浏览器首次打开
+控制台时使用 HTTP Basic 登录：用户名为 `auditor`，密码为
+`AUDITOR_ACCESS_TOKEN` 的值。直接使用本机 `127.0.0.1` 启动开发服务时不要求令牌；
+非本机客户端必须认证。这组数据库凭据只供本地开发，生产部署必须替换并通过密钥
+管理系统注入。
 
 ## 接入真实端点
 
@@ -120,7 +126,7 @@ Compose 使用 PostgreSQL 保存审计记录；这组凭据只供本地开发，
 ```bash
 export AUDITOR_ALLOWED_API_KEY_ENVS='RELAY_AUDIT_KEY'
 export AUDITOR_API_KEY_BASE_URL_BINDINGS='{"RELAY_AUDIT_KEY":["https://relay.example.com/v1"]}'
-export AUDITOR_MANAGEMENT_TOKEN="$(openssl rand -hex 32)"
+export AUDITOR_MANAGEMENT_TOKEN="${AUDITOR_MANAGEMENT_TOKEN:-$AUDITOR_ACCESS_TOKEN}"
 export RELAY_AUDIT_KEY='...'
 
 admin_curl() {
@@ -133,6 +139,7 @@ admin_curl() {
 变量；`AUDITOR_API_KEY_BASE_URL_BINDINGS` 还必须把每个变量绑定到允许接收该 Key 的
 Base URL。创建登记和实际执行都会检查这个运维侧映射，API 调用方不能靠自行登记其他
 地址绕过。所有使用托管 Key 的登记、发现和审计还必须提供至少 24 字符的本地管理令牌；
+未单独设置 `AUDITOR_MANAGEMENT_TOKEN` 时，服务会复用 `AUDITOR_ACCESS_TOKEN`；
 示例函数通过标准输入把令牌交给 curl，避免把令牌展开到进程参数。采样子进程只获得
 当前任务对应的随机临时变量，不继承服务进程里的其他供应商 Key。
 托管 Key 只允许发送到 HTTPS Base URL；只有显式的 `localhost`、`127.0.0.1` 或 `::1`
@@ -161,10 +168,37 @@ admin_curl -sS -X POST \
   "http://127.0.0.1:8000/api/v1/endpoints/${endpoint_id}/models"
 ```
 
+`AUDITOR_ALLOWED_API_KEY_ENVS` 是逗号分隔的显式白名单。服务只会读取白名单中的
+变量，并把所选 Key 以任务级临时变量交给采样子进程；未选择 Key 时会移除采样器
+可能自动读取的默认 Key 变量，避免把服务进程中的其他凭据带到目标端点。
+服务端环境凭据模式还必须配置 `AUDITOR_ACCESS_TOKEN`；登记带 `api_key_env` 的端点
+以及实际使用该凭据时都要求 Basic 或 Bearer 认证。未配置访问令牌时该模式直接禁用，
+即使请求来自本机也不会读取服务进程中的 Key。
+
+首次使用前还要把该变量与固定的 Base URL 和模型登记绑定：
+
+```bash
+curl -sS http://127.0.0.1:8000/api/v1/endpoints \
+  -u "auditor:${AUDITOR_ACCESS_TOKEN}" \
+  -H 'content-type: application/json' \
+  -d '{
+    "name": "approved-relay-model",
+    "provider": "relay",
+    "base_url": "https://relay.example.com/v1",
+    "model": "claimed-model",
+    "api_key_env": "RELAY_AUDIT_KEY"
+  }'
+```
+
+审计请求中的 `base_url + model + api_key_env` 必须与一条启用的登记记录完全匹配，
+防止把已批准的 Key 改送到请求临时指定的其他地址。`base_url` 只允许主机与路径，
+不得包含 userinfo、query 或 fragment，避免凭据被误放进 URL 后进入日志或证据。
+
 再提交：
 
 ```bash
-admin_curl -sS http://127.0.0.1:8000/api/v1/audits/smoke \
+curl -sS http://127.0.0.1:8000/api/v1/audits/smoke \
+  -u "auditor:${AUDITOR_ACCESS_TOKEN}" \
   -H 'content-type: application/json' \
   -d '{
     "target": {

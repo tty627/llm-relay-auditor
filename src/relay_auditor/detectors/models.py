@@ -1,4 +1,5 @@
 import asyncio
+import unicodedata
 from typing import Any
 
 import httpx
@@ -44,8 +45,8 @@ async def discover_models(
     attempts = 0
     async with httpx.AsyncClient(
         timeout=timeout_seconds,
-        transport=transport,
         follow_redirects=False,
+        transport=transport,
     ) as client:
         while True:
             attempts += 1
@@ -61,9 +62,7 @@ async def discover_models(
             delay = _retry_delay(response, attempts - 1)
             if delay:
                 await asyncio.sleep(delay)
-    if not response.is_success:
-        response.raise_for_status()
-        raise RuntimeError(f"model discovery returned HTTP {response.status_code}")
+    response.raise_for_status()
     payload = response.json()
     raw_models = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(raw_models, list):
@@ -80,8 +79,20 @@ async def discover_models(
         model_id = model_id.strip()
         if not model_id or model_id in seen:
             continue
-        seen.add(model_id)
         owner = item.get("owned_by")
+        if credential:
+            normalized_key = unicodedata.normalize("NFC", credential).casefold()
+            untrusted_strings = [model_id]
+            if isinstance(owner, str):
+                untrusted_strings.append(owner)
+            if any(
+                normalized_key in unicodedata.normalize("NFC", value).casefold()
+                for value in untrusted_strings
+            ):
+                raise RuntimeError(
+                    "endpoint /models response contained a possible credential echo"
+                )
+        seen.add(model_id)
         models.append(
             {
                 "id": model_id,
