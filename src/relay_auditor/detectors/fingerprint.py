@@ -6,6 +6,7 @@ import os
 import re
 import unicodedata
 from collections.abc import Callable
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -524,32 +525,45 @@ class FingerprintRunner:
             temporary_fingerprint_path.replace(fingerprint_path)
             fingerprint_promoted = True
         except Exception as error:
-            if fingerprint_promoted:
-                fingerprint_path.unlink(missing_ok=True)
-            if samples_promoted:
-                samples_path.unlink(missing_ok=True)
-            restore_errors: list[Exception] = []
+            recovery_errors: list[Exception] = []
             if fingerprint_backed_up:
                 try:
                     fingerprint_backup.replace(fingerprint_path)
                     fingerprint_backed_up = False
                 except Exception as restore_error:  # pragma: no cover - catastrophic FS failure
-                    restore_errors.append(restore_error)
+                    recovery_errors.append(restore_error)
+            elif fingerprint_promoted:
+                try:
+                    fingerprint_path.unlink(missing_ok=True)
+                except Exception as cleanup_error:
+                    recovery_errors.append(cleanup_error)
             if samples_backed_up:
                 try:
                     samples_backup.replace(samples_path)
                     samples_backed_up = False
                 except Exception as restore_error:  # pragma: no cover - catastrophic FS failure
-                    restore_errors.append(restore_error)
-            if restore_errors:
+                    recovery_errors.append(restore_error)
+            elif samples_promoted:
+                try:
+                    samples_path.unlink(missing_ok=True)
+                except Exception as cleanup_error:
+                    recovery_errors.append(cleanup_error)
+            if recovery_errors:
                 raise RuntimeError(
                     "paper-fingerprint output commit failed and prior artifacts "
                     "could not be fully restored"
                 ) from error
             raise
         else:
-            fingerprint_backup.unlink(missing_ok=True)
-            samples_backup.unlink(missing_ok=True)
+            # Both final paths already contain the committed pair. Obsolete
+            # backup cleanup is best-effort and must not turn that success into
+            # a reported collection failure; a failed backup remains recoverable.
+            if fingerprint_backed_up:
+                with suppress(OSError):
+                    fingerprint_backup.unlink(missing_ok=True)
+            if samples_backed_up:
+                with suppress(OSError):
+                    samples_backup.unlink(missing_ok=True)
 
     @classmethod
     def _preserve_paper_partial_collection(

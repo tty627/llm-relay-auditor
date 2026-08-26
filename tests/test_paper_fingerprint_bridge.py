@@ -603,7 +603,7 @@ async def test_collect_paper_profile_rejects_tampered_partial_and_preserves_exis
 
 
 @pytest.mark.asyncio
-async def test_collect_paper_profile_partial_commit_failure_restores_existing_pair(
+async def test_collect_paper_profile_partial_commit_failure_restores_existing_pair_without_unlink(
     tmp_path,
     monkeypatch,
 ):
@@ -624,17 +624,24 @@ async def test_collect_paper_profile_partial_commit_failure_restores_existing_pa
         raise FingerprintPausedError("paused")
 
     original_replace = Path.replace
-    injected_failures = 0
+    original_unlink = Path.unlink
+    injected_failures = {"promotion": 0, "promoted_unlink": 0}
 
     def fail_second_promotion(self, target):
-        nonlocal injected_failures
         if self == captured.get("temporary_fingerprint") and Path(target) == output_path:
-            injected_failures += 1
+            injected_failures["promotion"] += 1
             raise OSError("simulated partial fingerprint promotion failure")
         return original_replace(self, target)
 
+    def forbid_promoted_path_unlink(self, *args, **kwargs):
+        if self in {output_path, samples_path}:
+            injected_failures["promoted_unlink"] += 1
+            raise AssertionError("existing backups must be restored without unlinking final paths")
+        return original_unlink(self, *args, **kwargs)
+
     monkeypatch.setattr(runner, "_execute_with_code", fake_execute_with_code)
     monkeypatch.setattr(Path, "replace", fail_second_promotion)
+    monkeypatch.setattr(Path, "unlink", forbid_promoted_path_unlink)
     with pytest.raises(FingerprintPausedError) as caught:
         await runner.collect_paper_profile(
             EndpointSpec(base_url="https://example.test/v1", model="paper-model"),
@@ -648,7 +655,7 @@ async def test_collect_paper_profile_partial_commit_failure_restores_existing_pa
         )
 
     assert caught.value.partial_artifact is None
-    assert injected_failures == 1
+    assert injected_failures == {"promotion": 1, "promoted_unlink": 0}
     assert output_path.read_text(encoding="utf-8") == "old fingerprint"
     assert samples_path.read_text(encoding="utf-8") == "old samples"
     assert not list(tmp_path.glob(".*.tmp*"))
@@ -709,6 +716,132 @@ async def test_collect_paper_profile_partial_restore_failure_is_not_silenced(
     fingerprint_backups = list(tmp_path.glob(".*.backup"))
     assert len(fingerprint_backups) == 1
     assert fingerprint_backups[0].read_text(encoding="utf-8") == "old fingerprint"
+    assert not list(tmp_path.glob(".*.tmp*"))
+
+
+def test_paper_artifact_pair_surfaces_unrestored_promoted_file(tmp_path, monkeypatch):
+    temporary_fingerprint_path = tmp_path / ".fingerprint.tmp"
+    temporary_samples_path = tmp_path / ".samples.tmp.jsonl"
+    fingerprint_path = tmp_path / "fingerprint.json"
+    samples_path = tmp_path / "samples.jsonl"
+    temporary_fingerprint_path.write_text("new fingerprint", encoding="utf-8")
+    temporary_samples_path.write_text("new samples", encoding="utf-8")
+
+    original_replace = Path.replace
+    original_unlink = Path.unlink
+    injected_failures = {"promotion": 0, "cleanup_unlink": 0}
+
+    def fail_fingerprint_promotion(self, target):
+        if self == temporary_fingerprint_path and Path(target) == fingerprint_path:
+            injected_failures["promotion"] += 1
+            raise OSError("simulated fingerprint promotion failure")
+        return original_replace(self, target)
+
+    def fail_promoted_samples_cleanup(self, *args, **kwargs):
+        if self == samples_path:
+            injected_failures["cleanup_unlink"] += 1
+            raise OSError("simulated promoted samples cleanup failure")
+        return original_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "replace", fail_fingerprint_promotion)
+    monkeypatch.setattr(Path, "unlink", fail_promoted_samples_cleanup)
+    with pytest.raises(RuntimeError, match="could not be fully restored") as caught:
+        FingerprintRunner._commit_paper_artifact_pair(
+            temporary_fingerprint_path=temporary_fingerprint_path,
+            temporary_samples_path=temporary_samples_path,
+            fingerprint_path=fingerprint_path,
+            samples_path=samples_path,
+        )
+
+    assert isinstance(caught.value.__cause__, OSError)
+    assert str(caught.value.__cause__) == "simulated fingerprint promotion failure"
+    assert injected_failures == {"promotion": 1, "cleanup_unlink": 1}
+    assert temporary_fingerprint_path.read_text(encoding="utf-8") == "new fingerprint"
+    assert not temporary_samples_path.exists()
+    assert not fingerprint_path.exists()
+    assert samples_path.read_text(encoding="utf-8") == "new samples"
+    assert not list(tmp_path.glob(".*.backup"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("collection_kind", "failed_backup"),
+    [("partial", "fingerprint"), ("complete", "samples")],
+)
+async def test_collect_paper_profile_backup_cleanup_failure_keeps_committed_pair(
+    tmp_path,
+    monkeypatch,
+    collection_kind,
+    failed_backup,
+):
+    cli_path = tmp_path / "cli.js"
+    cli_path.write_text("// fake", encoding="utf-8")
+    runner = FingerprintRunner(cli_path)
+    output_path = tmp_path / "fingerprint.json"
+    samples_path = tmp_path / "samples.jsonl"
+    output_path.write_text("old fingerprint", encoding="utf-8")
+    samples_path.write_text("old samples", encoding="utf-8")
+
+    async def fake_execute(arguments, **kwargs):
+        actual_output = Path(arguments[arguments.index("--out") + 1])
+        actual_samples = Path(arguments[arguments.index("--samples-out") + 1])
+        if collection_kind == "partial":
+            write_partial_paper_artifacts(actual_output, actual_samples, completed=2)
+            raise FingerprintPausedError("paused")
+        return write_paper_artifacts(actual_output, actual_samples)
+
+    failed_path = output_path if failed_backup == "fingerprint" else samples_path
+    failed_backup_prefix = f".{failed_path.name}."
+    original_unlink = Path.unlink
+    backup_cleanup_attempts = []
+
+    def fail_selected_backup_cleanup(self, *args, **kwargs):
+        if self.name.endswith(".backup"):
+            backup_cleanup_attempts.append(self)
+            if self.name.startswith(failed_backup_prefix):
+                raise OSError("simulated backup cleanup failure")
+        return original_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_selected_backup_cleanup)
+    if collection_kind == "partial":
+        monkeypatch.setattr(runner, "_execute_with_code", fake_execute)
+        with pytest.raises(FingerprintPausedError) as caught:
+            await runner.collect_paper_profile(
+                EndpointSpec(base_url="https://example.test/v1", model="paper-model"),
+                role="audit",
+                scheduler_seed="safe-seed",
+                output_path=output_path,
+                samples_output_path=samples_path,
+                samples=1,
+                concurrency=2,
+                cancel_event=asyncio.Event(),
+            )
+        assert caught.value.partial_artifact is not None
+        assert caught.value.partial_artifact["completedSamples"] == 2
+        expected_lines = 2
+    else:
+        monkeypatch.setattr(runner, "_execute", fake_execute)
+        result = await runner.collect_paper_profile(
+            EndpointSpec(base_url="https://example.test/v1", model="paper-model"),
+            role="audit",
+            scheduler_seed="safe-seed",
+            output_path=output_path,
+            samples_output_path=samples_path,
+            samples=1,
+            concurrency=2,
+        )
+        assert result["fingerprint"]["quality"]["complete"] is True
+        expected_lines = 40
+
+    fingerprint = json.loads(output_path.read_text(encoding="utf-8"))
+    assert fingerprint["quality"]["complete"] is (collection_kind == "complete")
+    assert len(samples_path.read_text(encoding="utf-8").splitlines()) == expected_lines
+    assert len(backup_cleanup_attempts) == 2
+    remaining_backups = list(tmp_path.glob(".*.backup"))
+    assert len(remaining_backups) == 1
+    assert remaining_backups[0].name.startswith(failed_backup_prefix)
+    expected_old_content = "old fingerprint" if failed_backup == "fingerprint" else "old samples"
+    assert remaining_backups[0].read_text(encoding="utf-8") == expected_old_content
     assert not list(tmp_path.glob(".*.tmp*"))
 
 
