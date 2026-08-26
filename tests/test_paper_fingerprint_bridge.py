@@ -530,6 +530,189 @@ async def test_collect_paper_profile_drops_normalized_credential_echo_partial(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tamper", ["sha", "plan", "completed"])
+async def test_collect_paper_profile_rejects_tampered_partial_and_preserves_existing_pair(
+    tmp_path,
+    monkeypatch,
+    tamper,
+):
+    cli_path = tmp_path / "cli.js"
+    cli_path.write_text("// fake", encoding="utf-8")
+    runner = FingerprintRunner(cli_path)
+    output_path = tmp_path / "fingerprint.json"
+    samples_path = tmp_path / "samples.jsonl"
+    output_path.write_text("old fingerprint", encoding="utf-8")
+    samples_path.write_text("old samples", encoding="utf-8")
+    validated_completed = []
+    original_validate_evidence = FingerprintRunner._validate_paper_evidence_jsonl
+
+    def validate_evidence_with_observation(*args, **kwargs):
+        validated_completed.append(kwargs.get("expected_completed"))
+        return original_validate_evidence(*args, **kwargs)
+
+    async def fake_execute_with_code(arguments, **kwargs):
+        actual_output = Path(arguments[arguments.index("--out") + 1])
+        actual_samples = Path(arguments[arguments.index("--samples-out") + 1])
+        fingerprint = write_partial_paper_artifacts(
+            actual_output,
+            actual_samples,
+            completed=2,
+        )
+        if tamper == "sha":
+            fingerprint["quality"]["rawEvidenceSha256"] = "0" * 64
+        elif tamper == "plan":
+            fingerprint["plan"]["schedulerSeed"] = "tampered-seed"
+        else:
+            fingerprint["completedSamples"] = 3
+            fingerprint["quality"]["completedSamples"] = 3
+            fingerprint["quality"]["validSamples"] = 3
+            first_sample = json.loads(
+                actual_samples.read_text(encoding="utf-8").splitlines()[0]
+            )
+            cell = fingerprint["cells"][first_sample["cellId"]]
+            cell["counts"] = {"7": 2}
+            cell["validCount"] = 2
+            cell["totalCount"] = 2
+        actual_output.write_text(json.dumps(fingerprint), encoding="utf-8")
+        raise FingerprintPausedError("paused")
+
+    monkeypatch.setattr(runner, "_execute_with_code", fake_execute_with_code)
+    monkeypatch.setattr(
+        FingerprintRunner,
+        "_validate_paper_evidence_jsonl",
+        staticmethod(validate_evidence_with_observation),
+    )
+    with pytest.raises(FingerprintPausedError) as caught:
+        await runner.collect_paper_profile(
+            EndpointSpec(base_url="https://example.test/v1", model="paper-model"),
+            role="audit",
+            scheduler_seed="safe-seed",
+            output_path=output_path,
+            samples_output_path=samples_path,
+            samples=1,
+            concurrency=2,
+            cancel_event=asyncio.Event(),
+        )
+
+    assert caught.value.partial_artifact is None
+    assert validated_completed == ([3] if tamper == "completed" else [])
+    assert output_path.read_text(encoding="utf-8") == "old fingerprint"
+    assert samples_path.read_text(encoding="utf-8") == "old samples"
+    assert not list(tmp_path.glob(".*.tmp*"))
+    assert not list(tmp_path.glob(".*.backup"))
+
+
+@pytest.mark.asyncio
+async def test_collect_paper_profile_partial_commit_failure_restores_existing_pair(
+    tmp_path,
+    monkeypatch,
+):
+    cli_path = tmp_path / "cli.js"
+    cli_path.write_text("// fake", encoding="utf-8")
+    runner = FingerprintRunner(cli_path)
+    output_path = tmp_path / "fingerprint.json"
+    samples_path = tmp_path / "samples.jsonl"
+    output_path.write_text("old fingerprint", encoding="utf-8")
+    samples_path.write_text("old samples", encoding="utf-8")
+    captured = {}
+
+    async def fake_execute_with_code(arguments, **kwargs):
+        actual_output = Path(arguments[arguments.index("--out") + 1])
+        actual_samples = Path(arguments[arguments.index("--samples-out") + 1])
+        captured["temporary_fingerprint"] = actual_output
+        write_partial_paper_artifacts(actual_output, actual_samples, completed=2)
+        raise FingerprintPausedError("paused")
+
+    original_replace = Path.replace
+    injected_failures = 0
+
+    def fail_second_promotion(self, target):
+        nonlocal injected_failures
+        if self == captured.get("temporary_fingerprint") and Path(target) == output_path:
+            injected_failures += 1
+            raise OSError("simulated partial fingerprint promotion failure")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(runner, "_execute_with_code", fake_execute_with_code)
+    monkeypatch.setattr(Path, "replace", fail_second_promotion)
+    with pytest.raises(FingerprintPausedError) as caught:
+        await runner.collect_paper_profile(
+            EndpointSpec(base_url="https://example.test/v1", model="paper-model"),
+            role="audit",
+            scheduler_seed="safe-seed",
+            output_path=output_path,
+            samples_output_path=samples_path,
+            samples=1,
+            concurrency=2,
+            cancel_event=asyncio.Event(),
+        )
+
+    assert caught.value.partial_artifact is None
+    assert injected_failures == 1
+    assert output_path.read_text(encoding="utf-8") == "old fingerprint"
+    assert samples_path.read_text(encoding="utf-8") == "old samples"
+    assert not list(tmp_path.glob(".*.tmp*"))
+    assert not list(tmp_path.glob(".*.backup"))
+
+
+@pytest.mark.asyncio
+async def test_collect_paper_profile_partial_restore_failure_is_not_silenced(
+    tmp_path,
+    monkeypatch,
+):
+    cli_path = tmp_path / "cli.js"
+    cli_path.write_text("// fake", encoding="utf-8")
+    runner = FingerprintRunner(cli_path)
+    output_path = tmp_path / "fingerprint.json"
+    samples_path = tmp_path / "samples.jsonl"
+    output_path.write_text("old fingerprint", encoding="utf-8")
+    samples_path.write_text("old samples", encoding="utf-8")
+    captured = {}
+
+    async def fake_execute_with_code(arguments, **kwargs):
+        actual_output = Path(arguments[arguments.index("--out") + 1])
+        actual_samples = Path(arguments[arguments.index("--samples-out") + 1])
+        captured["temporary_fingerprint"] = actual_output
+        write_partial_paper_artifacts(actual_output, actual_samples, completed=2)
+        raise FingerprintPausedError("paused")
+
+    original_replace = Path.replace
+    injected_failures = {"promotion": 0, "restore": 0}
+
+    def fail_promotion_and_fingerprint_restore(self, target):
+        target_path = Path(target)
+        if self == captured.get("temporary_fingerprint") and target_path == output_path:
+            injected_failures["promotion"] += 1
+            raise OSError("simulated partial fingerprint promotion failure")
+        if self.name.endswith(".backup") and target_path == output_path:
+            injected_failures["restore"] += 1
+            raise OSError("simulated fingerprint restore failure")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(runner, "_execute_with_code", fake_execute_with_code)
+    monkeypatch.setattr(Path, "replace", fail_promotion_and_fingerprint_restore)
+    with pytest.raises(RuntimeError, match="could not be fully restored"):
+        await runner.collect_paper_profile(
+            EndpointSpec(base_url="https://example.test/v1", model="paper-model"),
+            role="audit",
+            scheduler_seed="safe-seed",
+            output_path=output_path,
+            samples_output_path=samples_path,
+            samples=1,
+            concurrency=2,
+            cancel_event=asyncio.Event(),
+        )
+
+    assert injected_failures == {"promotion": 1, "restore": 1}
+    assert not output_path.exists()
+    assert samples_path.read_text(encoding="utf-8") == "old samples"
+    fingerprint_backups = list(tmp_path.glob(".*.backup"))
+    assert len(fingerprint_backups) == 1
+    assert fingerprint_backups[0].read_text(encoding="utf-8") == "old fingerprint"
+    assert not list(tmp_path.glob(".*.tmp*"))
+
+
+@pytest.mark.asyncio
 async def test_real_paper_cli_cancel_after_first_progress_preserves_sha_bound_partial(
     tmp_path,
 ):

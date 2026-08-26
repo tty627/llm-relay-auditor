@@ -676,13 +676,6 @@ class FingerprintRunner:
             )
             if marked is None or marked["incompleteReason"] != incomplete_reason:
                 return None
-            cls._commit_paper_artifact_pair(
-                temporary_fingerprint_path=temporary_fingerprint_path,
-                temporary_samples_path=temporary_samples_path,
-                fingerprint_path=fingerprint_path,
-                samples_path=samples_path,
-            )
-            return cls.partial_artifact_summary(fingerprint_path)
         except (
             OSError,
             RuntimeError,
@@ -692,6 +685,19 @@ class FingerprintRunner:
             json.JSONDecodeError,
         ):
             return None
+        # A normal promotion failure is safe to treat as no retained partial
+        # after the paired commit restores the prior files. A failed restore is
+        # escalated by the commit helper as RuntimeError and must remain visible.
+        try:
+            cls._commit_paper_artifact_pair(
+                temporary_fingerprint_path=temporary_fingerprint_path,
+                temporary_samples_path=temporary_samples_path,
+                fingerprint_path=fingerprint_path,
+                samples_path=samples_path,
+            )
+        except OSError:
+            return None
+        return cls.partial_artifact_summary(fingerprint_path)
 
     async def verify(
         self,
