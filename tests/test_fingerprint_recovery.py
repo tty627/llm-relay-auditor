@@ -346,6 +346,35 @@ async def test_user_cancellation_stops_child_before_idle_timeout(tmp_path: Path)
         await asyncio.wait_for(pending, timeout=0.5)
 
 
+async def test_completed_process_wins_same_turn_cancellation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cli_path = tmp_path / "complete.cjs"
+    cli_path.write_text(
+        "setTimeout(() => { process.stdout.write('{}'); }, 100);\n",
+        encoding="utf-8",
+    )
+    runner = FingerprintRunner(cli_path)
+    cancel_event = asyncio.Event()
+    cancel_event.set()
+    original_wait = asyncio.wait
+
+    async def wait_for_all(waiters, **kwargs):
+        return await original_wait(waiters, return_when=asyncio.ALL_COMPLETED)
+
+    monkeypatch.setattr(asyncio, "wait", wait_for_all)
+    exit_code, payload = await runner._execute_with_code(
+        ["node", str(cli_path), "verify"],
+        accepted_exit_codes={0},
+        environment=dict(os.environ),
+        cancel_event=cancel_event,
+    )
+
+    assert exit_code == 0
+    assert payload == {}
+
+
 def test_partial_artifact_summary_and_atomic_interruption_annotation(tmp_path: Path) -> None:
     path = tmp_path / "partial.json"
     partial = write_fingerprint(path, model="partial-model")
