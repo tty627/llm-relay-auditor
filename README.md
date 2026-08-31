@@ -48,7 +48,44 @@ uvicorn relay_auditor.main:app --reload
 
 ## Web 控制台
 
-控制台当前只运行 One Token 行为指纹：
+### Opus 5 单模型批量审计
+
+控制台首页现已提供正式的“ReferenceSet + 单模型批量测试”入口：
+
+1. 选择 `OpenAI Chat` 或 `Anthropic Messages`，填写参考名称、来源声明、URL、实际模型 ID 与凭据。
+2. 系统按顺序冻结采集 3 个参考成员；每个成员固定执行 canonical40 的 `40 cells × 30 samples = 1200` 个逻辑请求，并分别保存脱敏 JSONL、聚合指纹和 SHA-256。
+3. 只有三个成员均完整、协议/manifest/hash 一致且内部距离统计通过验证的 ReferenceSet 才能被选择。快照不可变，不会自动刷新或替换。
+4. 选择 ReferenceSet 后，可逐行录入或粘贴 1–20 个中转站；TSV 格式为 `站点名<TAB>URL<TAB>凭据<TAB>可选模型别名`。凭据可为明文 Key 或 `env:ALLOWLISTED_NAME`。
+5. 默认同时运行 4 个站、每站 3 个请求，全局最多 12 个；同一 origin 串行。页面实时显示采样进度、质量、JSD 距离、延迟和安全原因码，刷新页面不会中断后台任务。
+6. 终态可下载规范 JSON 和由该 JSON 验证后派生的 CSV。结果只给出相对参考快照的探索性分级，始终保持 `decisionEligible=false` 与 `operationalVerdict=unverifiable`，不输出“官方/非官方”或“真/假”结论。
+
+两个严格 transport profile 不可混用：
+
+- `openai-chat-onetoken-v1`：`POST /v1/chat/completions`，固定 `temperature=1`、`max_tokens=16`、关闭 reasoning、请求 usage。
+- `anthropic-messages-opus5-onetoken-v1`：`POST /v1/messages`，固定 `temperature=1`、`max_tokens=16`、`thinking.disabled` 与 `output_config.effort=high`；thinking/tool/XML 内容不会进入答案分布。
+
+参考采集固定需要 3600 个逻辑请求；每个目标站再需要 1200 个，另有每站最多 240 次的有界重试预算。20 个站的基础请求量为 27,600。首次使用真实 Key 前应先完成仓库的 Mock 与安全回归；测试命令见下文。
+
+对应 API：
+
+```text
+POST /api/v1/console/reference-sets
+GET  /api/v1/console/reference-sets
+GET  /api/v1/console/reference-sets/{id}
+POST /api/v1/console/reference-sets/{id}/pause|resume|cancel
+
+POST /api/v1/console/one-model-batches
+GET  /api/v1/console/one-model-batches/{id}
+POST /api/v1/console/one-model-batches/{id}/pause|resume|cancel
+GET  /api/v1/console/one-model-batches/{id}/report.json
+GET  /api/v1/console/one-model-batches/{id}/report.csv
+```
+
+页面提交成功会立即清空明文 Key 和 TSV 粘贴区；Key、环境变量名及上游错误正文不会进入任务数据库、日志或报告。服务重启会把缺少内存凭据的未完成条目标记为 `interrupted`，不会自动重放请求。
+
+### 旧版多模型工作台
+
+原有工作台继续运行 One Token 行为指纹，作为历史兼容入口：
 
 1. 填写可信参考端的 Base URL 和 Key，通过 `GET /models` 读取模型列表；也可以手动添加模型 ID。新任务默认选择论文 V2 canonical40，旧版 V1 只用于快速诊断和历史兼容。
 2. 勾选一个或多个参考模型后创建后台采集批次。论文 V2 固定使用 40 cells × 每 cell 30 样本，并保存聚合指纹 JSON、逐请求 canonical JSONL 及两者的 SHA-256；参考端名称、URL、模型 ID 和证据登记到本地 SQLite，Key 只留在服务内存。
@@ -62,7 +99,7 @@ uvicorn relay_auditor.main:app --reload
 10. 并发可选固定或自动。参考采集的自动模式首个模型从 `min(2, 最大并发)` 开始，后续模型根据本批上一模型的失败、错误率和重试活动降档或逐档试探；待测对比则按中转站名称、规范化 URL、目标模型和同一指纹协议读取本机历史。两类任务都会保存实际并发与选择原因。
 11. 当旧版原始 verdict 为 `uncertain` 或 `mismatch` 时，页面会把已经采集的目标指纹与本机其他有效参考指纹离线比较，按模型聚合并列出最相似候选。该步骤不会再次请求中转站，也不会把 operational verdict 从 `unverifiable` 提升为身份结论；候选距离只供探索。
 
-默认表单已填入本地 Mock，可在不使用真实 Key 的情况下验证完整交互。论文 V2 每个模型需要 1200 次固定探针请求；只想快速检查工程链路时可显式切换 legacy V1。模型发现要求端点兼容 `GET /models`，采样要求兼容 `POST /chat/completions`；任一接口不兼容时仍可手动填写模型 ID。不同供应商的原生 Responses/Messages 协议尚未接入此页面。
+默认表单已填入本地 Mock，可在不使用真实 Key 的情况下验证完整交互。论文 V2 每个模型需要 1200 次固定探针请求；只想快速检查工程链路时可显式切换 legacy V1。模型发现要求端点兼容 `GET /models`，采样要求兼容 `POST /chat/completions`；任一接口不兼容时仍可手动填写模型 ID。原生 Responses 协议仍未接入；Anthropic Messages 仅通过上面的正式单模型批量入口使用。
 
 浏览器输入的 Key 只发送给本机 `/api/v1/console/*` 接口，并通过该任务独立的子进程环境传给采样器；不会进入命令行参数、数据库、证据文件或浏览器持久存储。控制台 API 会拒绝非本机 Host 和跨 Origin 请求，Compose 也只发布到 `127.0.0.1`。页面不要通过公网地址访问。关闭页面前可以点击“清空全部 Key”。
 
@@ -108,6 +145,7 @@ python scripts/calibrate_mock.py
 
 ```bash
 git submodule update --init --recursive
+export AUDITOR_GIT_SHA="$(git rev-parse --verify 'HEAD^{commit}')"
 export AUDITOR_ACCESS_TOKEN="$(openssl rand -hex 32)"
 export AUDITOR_MANAGEMENT_TOKEN="$AUDITOR_ACCESS_TOKEN"
 docker compose up --build
@@ -117,7 +155,9 @@ Compose 使用 PostgreSQL 保存审计记录，并要求显式设置随机访问
 控制台时使用 HTTP Basic 登录：用户名为 `auditor`，密码为
 `AUDITOR_ACCESS_TOKEN` 的值。直接使用本机 `127.0.0.1` 启动开发服务时不要求令牌；
 非本机客户端必须认证。这组数据库凭据只供本地开发，生产部署必须替换并通过密钥
-管理系统注入。
+管理系统注入。容器不包含 `.git`，因此还必须把构建来源的十六进制 commit SHA 通过
+`AUDITOR_GIT_SHA` 注入；本地 Git checkout 启动时则会安全解析当前 `HEAD`。无法得到
+合法 SHA 时服务 fail closed，避免正式批次报告写入虚假的 `unknown` 版本。
 
 ## 接入真实端点
 

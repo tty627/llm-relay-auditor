@@ -313,7 +313,6 @@ def test_console_direct_verify_rejects_client_comparison_context(tmp_path: Path)
     )
     app = create_app(settings)
     with TestClient(app) as client:
-        _register_reference(app, reference_id, target_fingerprint)
         response = client.post(
             "/api/v1/console/fingerprints/verify",
             json={
@@ -1182,12 +1181,12 @@ def test_console_key_is_redacted_from_errors_and_audit_records(
         )
         assert response.status_code == 502
         assert secret not in response.text
-        assert "[REDACTED]" in response.text
+        assert response.json()["detail"] == "credential_echo_detected"
 
         audits = client.get("/api/v1/audits").json()["items"]
         assert len(audits) == 1
         assert secret not in str(audits[0])
-        assert "[REDACTED]" in str(audits[0])
+        assert "credential_echo_detected" in str(audits[0])
 
 
 def test_console_verify_preserves_target_fingerprint_after_processing_failure(

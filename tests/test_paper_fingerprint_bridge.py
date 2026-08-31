@@ -32,6 +32,7 @@ TASKS = (
 LANGUAGES = ("en", "ru", "zh", "ar")
 CELL_IDS = [f"{task}:{language}" for task in TASKS for language in LANGUAGES]
 PROTOCOL = "bruckner-2026-canonical40/v1"
+TRANSPORT_PROFILE = "openai-chat-onetoken-v1"
 
 
 def write_paper_artifacts(
@@ -117,6 +118,7 @@ def write_paper_artifacts(
         "manifest": {
             "manifestVersion": 1,
             "protocolId": PROTOCOL,
+            "transportProfileId": TRANSPORT_PROFILE,
             "battery": {
                 "id": "bruckner-2026-canonical40",
                 "version": "1.0.0",
@@ -171,6 +173,8 @@ def write_paper_artifacts(
             "reasoningTokenCount": 0,
             "reasoningUsageObservedSamples": 40,
             "rawEvidenceSha256": digest,
+            "attemptCount": 40,
+            "retryCount": 0,
         },
         "completedSamples": 40,
         "expectedSamples": 40,
@@ -184,6 +188,7 @@ def write_paper_artifacts(
             "interpretation": "uncalibrated-non-decision-evidence",
             "decisionEligible": False,
             "protocol": PROTOCOL,
+            "transportProfileId": TRANSPORT_PROFILE,
             "model": model,
             "role": role,
             "cellCount": 40,
@@ -192,6 +197,8 @@ def write_paper_artifacts(
             "validSamples": 40,
             "invalidSamples": 0,
             "errorSamples": 0,
+            "attemptCount": 40,
+            "retryCount": 0,
             "directness": "verified",
             "splitHalfMeanJsd": None,
             "splitHalfComparableCells": 0,
@@ -269,6 +276,8 @@ def write_partial_paper_artifacts(
         reasoningTokenCount=0,
         reasoningUsageObservedSamples=completed,
         rawEvidenceSha256=hashlib.sha256(evidence_text.encode()).hexdigest(),
+        attemptCount=completed,
+        retryCount=0,
     )
     output_path.write_text(json.dumps(fingerprint), encoding="utf-8")
     return fingerprint
@@ -693,7 +702,7 @@ async def test_collect_paper_profile_leak_failure_preserves_final_paths(tmp_path
         return payload
 
     monkeypatch.setattr(runner, "_execute", fake_execute)
-    with pytest.raises(RuntimeError, match="API key material"):
+    with pytest.raises(RuntimeError, match="credential echo material"):
         await runner.collect_paper_profile(
             EndpointSpec(base_url="https://example.test/v1", model="paper-model"),
             role="audit",
@@ -781,7 +790,7 @@ process.exit(7)
     )
     runner = FingerprintRunner(cli_path)
     secret = "sk-paper-cli-error-secret"
-    with pytest.raises(RuntimeError, match="exit code 7") as captured:
+    with pytest.raises(RuntimeError, match="possible credential echo") as captured:
         await runner.collect_paper_profile(
             EndpointSpec(base_url="https://example.test/v1", model="paper-model"),
             role="audit",
@@ -793,7 +802,6 @@ process.exit(7)
             api_key=secret,
         )
     assert secret not in str(captured.value)
-    assert "[REDACTED]" in str(captured.value)
 
 
 @pytest.mark.asyncio

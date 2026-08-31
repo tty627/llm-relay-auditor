@@ -1,4 +1,4 @@
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     AnyHttpUrl,
@@ -16,6 +16,12 @@ OneTokenMethodProfileId = Literal[
     "legacy-one-token/v1",
     "bruckner-2026-canonical40/v1",
 ]
+Protocol = Literal["anthropic_messages", "openai_chat"]
+TransportProfileId = Literal[
+    "openai-chat-onetoken-v1",
+    "anthropic-messages-opus5-onetoken-v1",
+]
+ReferenceSourceType = Literal["official_api", "trusted_relay"]
 
 
 def reject_url_userinfo(value: AnyHttpUrl) -> AnyHttpUrl:
@@ -192,6 +198,72 @@ class ConsoleReferenceCollectionRequest(BaseModel):
         return self
 
 
+class EphemeralCredentialSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["ephemeral"]
+    api_key: SecretStr = Field(min_length=1, max_length=4096)
+
+    def reveal_api_key(self) -> str:
+        return self.api_key.get_secret_value()
+
+
+class EnvironmentCredentialSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["env_ref"]
+    name: str = Field(pattern=r"^[A-Z_][A-Z0-9_]*$", max_length=100)
+
+
+CredentialSpec = Annotated[
+    EphemeralCredentialSpec | EnvironmentCredentialSpec,
+    Field(discriminator="mode"),
+]
+
+
+class ReferenceSetCreateRequest(BaseModel):
+    """Strict single-model, three-epoch reference enrollment request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reference_name: str = Field(min_length=1, max_length=60)
+    source_type: ReferenceSourceType
+    protocol: Protocol
+    transport_profile_id: TransportProfileId
+    logical_model: str = Field(min_length=1, max_length=255)
+    actual_model: str = Field(min_length=1, max_length=255)
+    base_url: AnyHttpUrl
+    credential: CredentialSpec
+    anthropic_workspace_id: str | None = Field(default=None, min_length=1, max_length=255)
+    cell_count: Literal[40] = 40
+    samples_per_cell: Literal[30] = 30
+    member_count: Literal[3] = 3
+    concurrency: int = Field(default=3, ge=1, le=4)
+    request_timeout_seconds: float = Field(default=30, ge=3, le=120)
+    member_timeout_seconds: float = Field(default=7200, ge=60, le=7200)
+
+    _reject_base_url_userinfo = field_validator("base_url")(reject_url_userinfo)
+
+    @field_validator("base_url")
+    @classmethod
+    def require_https(cls, value: AnyHttpUrl) -> AnyHttpUrl:
+        if value.scheme != "https":
+            raise ValueError("ReferenceSet base_url must use HTTPS")
+        return value
+
+    @model_validator(mode="after")
+    def validate_protocol_profile(self):
+        expected = {
+            "openai_chat": "openai-chat-onetoken-v1",
+            "anthropic_messages": "anthropic-messages-opus5-onetoken-v1",
+        }[self.protocol]
+        if self.transport_profile_id != expected:
+            raise ValueError("protocol and transport_profile_id must match")
+        if self.protocol != "anthropic_messages" and self.anthropic_workspace_id is not None:
+            raise ValueError("anthropic_workspace_id is only valid for anthropic_messages")
+        return self
+
+
 class TokenizerCollectRequest(BaseModel):
     endpoint: EndpointSpec
     samples_per_point: int = Field(default=2, ge=1, le=5)
@@ -214,7 +286,7 @@ class ManagedEndpointCreateRequest(BaseModel):
     provider: str = Field(min_length=1, max_length=100)
     base_url: AnyHttpUrl
     model: str = Field(min_length=1, max_length=255)
-    protocol: Literal["openai_chat"] = "openai_chat"
+    protocol: Protocol = "openai_chat"
     api_key_env: str | None = Field(default=None, pattern=r"^[A-Z_][A-Z0-9_]*$")
 
     _reject_base_url_userinfo = field_validator("base_url")(reject_url_userinfo)

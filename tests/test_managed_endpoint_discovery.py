@@ -458,7 +458,7 @@ def test_managed_fingerprint_echo_never_reaches_response_database_or_evidence(
             },
         )
         assert response.status_code == 502
-        assert "output was rejected" in response.text
+        assert response.json()["detail"] == "credential_echo_detected"
         assert secret not in response.text
 
     assert secret.encode() not in database_path.read_bytes()

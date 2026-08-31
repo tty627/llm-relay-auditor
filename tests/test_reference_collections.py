@@ -444,7 +444,9 @@ def test_completed_reference_download_catalog_and_samples_reject_tampering(
 
         fingerprint_path.write_bytes(fingerprint_bytes + b"\n")
         assert client.get(f"/api/v1/console/evidence/{artifact_id}").status_code == 409
-        assert client.get("/api/v1/console/references").status_code == 409
+        catalog = client.get("/api/v1/console/references")
+        assert catalog.status_code == 200
+        assert catalog.json()["items"][0]["evidence_integrity"] == "corrupt"
         assert client.get(f"/api/v1/console/evidence/{artifact_id}/samples").status_code == 409
 
         fingerprint_path.write_bytes(fingerprint_bytes)
@@ -544,8 +546,12 @@ def test_comparison_history_and_download_reject_registered_artifact_tampering(
         assert download.content == artifact.path.read_bytes()
 
         artifact.path.write_bytes(artifact.path.read_bytes() + b"\n")
-        assert client.get("/api/v1/console/comparisons").status_code == 409
-        assert client.get("/api/v1/console/comparisons/latest").status_code == 409
+        history = client.get("/api/v1/console/comparisons")
+        assert history.status_code == 200
+        assert history.json()["items"][0]["evidence_integrity"] == "corrupt"
+        latest = client.get("/api/v1/console/comparisons/latest")
+        assert latest.status_code == 200
+        assert latest.json()["items"][0]["evidence_integrity"] == "corrupt"
         assert client.get(f"/api/v1/console/evidence/{audit_id}").status_code == 409
 
 

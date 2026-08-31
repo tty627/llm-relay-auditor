@@ -1,11 +1,14 @@
 import json
 import os
 import re
+import subprocess
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from pydantic import SecretStr
+from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_GIT_SHA_RE = re.compile(r"[0-9a-f]{7,64}")
 
 
 class Settings(BaseSettings):
@@ -18,6 +21,8 @@ class Settings(BaseSettings):
     api_key_base_url_bindings: str = "{}"
     access_token: SecretStr | None = None
     management_token: SecretStr | None = None
+    allow_test_loopback_endpoints: bool = False
+    git_sha: str | None = None
 
     model_config = SettingsConfigDict(
         env_prefix="AUDITOR_",
@@ -25,6 +30,65 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    @field_validator("git_sha")
+    @classmethod
+    def validate_git_sha(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        clean = value.strip().lower()
+        if _GIT_SHA_RE.fullmatch(clean) is None:
+            raise ValueError("AUDITOR_GIT_SHA must be a 7 to 64 character hex SHA")
+        return clean
+
+    def resolved_git_sha(self, project_root: Path | None = None) -> str:
+        """Return explicit build metadata or fail closed while resolving this checkout."""
+
+        if self.git_sha is not None:
+            return self.git_sha
+
+        root = (
+            project_root
+            if project_root is not None
+            else Path(__file__).resolve().parents[2]
+        ).resolve()
+        if not (root / ".git").exists():
+            raise RuntimeError(
+                "AUDITOR_GIT_SHA is required when the application is not running "
+                "from a Git checkout"
+            )
+
+        git_environment = {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PATH": os.defpath,
+        }
+        try:
+            completed = subprocess.run(
+                ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+                cwd=root,
+                env=git_environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                text=True,
+                timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise RuntimeError(
+                "unable to resolve Git HEAD; set AUDITOR_GIT_SHA explicitly"
+            ) from error
+
+        clean = completed.stdout.strip().lower()
+        if completed.returncode != 0 or _GIT_SHA_RE.fullmatch(clean) is None:
+            raise RuntimeError(
+                "unable to resolve Git HEAD; set AUDITOR_GIT_SHA explicitly"
+            )
+        return clean
 
     def api_key_env_allowlist(self) -> frozenset[str]:
         names = frozenset(

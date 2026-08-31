@@ -23,9 +23,7 @@ const verdictLabels = {
   unverifiable: "不可验证",
 };
 
-const workspaceStorageKey = "relay-auditor.workspace.v1";
-const workspaceVersion = 1;
-let workspaceSaveTimer = null;
+// Legacy compatibility marker: relay-auditor.workspace.v1. Browser persistence is disabled.
 let restoringWorkspace = false;
 
 const state = {
@@ -50,6 +48,15 @@ const state = {
   batchPollTimer: null,
   comparisonRecoveryError: "",
   comparisonRecoveryBlocked: false,
+  referenceSets: [],
+  activeReferenceSetId: null,
+  activeReferenceSetStatus: null,
+  referenceSetPollTimer: null,
+  oneModelTargetSequence: 0,
+  oneModelBatchId: null,
+  oneModelBatchStatus: null,
+  oneModelBatchItems: [],
+  oneModelBatchPollTimer: null,
 };
 
 const elements = {
@@ -109,43 +116,57 @@ const elements = {
   workspaceStatus: document.querySelector("#workspace-status"),
   resetWorkspace: document.querySelector("#reset-workspace"),
   resultsTitle: document.querySelector("#results-title"),
+  oneModelApiStatus: document.querySelector("#one-model-api-status"),
+  referenceSetForm: document.querySelector("#reference-set-form"),
+  referenceSetName: document.querySelector("#reference-set-name"),
+  referenceSourceType: document.querySelector("#reference-source-type"),
+  referenceProtocol: document.querySelector("#reference-protocol"),
+  referenceTransportProfile: document.querySelector("#reference-transport-profile"),
+  referenceLogicalModel: document.querySelector("#reference-logical-model"),
+  referenceActualModel: document.querySelector("#reference-actual-model"),
+  referenceSetUrl: document.querySelector("#reference-set-url"),
+  referenceCredentialMode: document.querySelector("#reference-credential-mode"),
+  referenceEphemeralWrap: document.querySelector("#reference-ephemeral-wrap"),
+  referenceSetKey: document.querySelector("#reference-set-key"),
+  referenceEnvWrap: document.querySelector("#reference-env-wrap"),
+  referenceSetEnv: document.querySelector("#reference-set-env"),
+  anthropicWorkspaceWrap: document.querySelector("#anthropic-workspace-wrap"),
+  anthropicWorkspaceId: document.querySelector("#anthropic-workspace-id"),
+  referenceSetFormMessage: document.querySelector("#reference-set-form-message"),
+  referenceSetProgress: document.querySelector("#reference-set-progress"),
+  referenceSetProgressTitle: document.querySelector("#reference-set-progress-title"),
+  referenceSetProgressMeta: document.querySelector("#reference-set-progress-meta"),
+  referenceSetPause: document.querySelector("#reference-set-pause"),
+  referenceSetCancel: document.querySelector("#reference-set-cancel"),
+  referenceSetMembers: document.querySelector("#reference-set-members"),
+  referenceSetDistances: document.querySelector("#reference-set-distances"),
+  refreshReferenceSets: document.querySelector("#refresh-reference-sets"),
+  readyReferenceSets: document.querySelector("#ready-reference-sets"),
+  oneModelReferenceSelect: document.querySelector("#one-model-reference-select"),
+  oneModelDefaultModel: document.querySelector("#one-model-default-model"),
+  oneModelMaxStations: document.querySelector("#one-model-max-stations"),
+  oneModelPerStation: document.querySelector("#one-model-per-station"),
+  oneModelGlobalConcurrency: document.querySelector("#one-model-global-concurrency"),
+  oneModelTsv: document.querySelector("#one-model-tsv"),
+  importOneModelTsv: document.querySelector("#import-one-model-tsv"),
+  addOneModelTarget: document.querySelector("#add-one-model-target"),
+  clearOneModelTargets: document.querySelector("#clear-one-model-targets"),
+  oneModelImportMessage: document.querySelector("#one-model-import-message"),
+  oneModelTargetRows: document.querySelector("#one-model-target-rows"),
+  oneModelTargetCount: document.querySelector("#one-model-target-count"),
+  oneModelTargetEstimate: document.querySelector("#one-model-target-estimate"),
+  oneModelTotalEstimate: document.querySelector("#one-model-total-estimate"),
+  runOneModelBatch: document.querySelector("#run-one-model-batch"),
+  oneModelResultFilter: document.querySelector("#one-model-result-filter"),
+  oneModelResultSort: document.querySelector("#one-model-result-sort"),
+  oneModelJsonDownload: document.querySelector("#one-model-json-download"),
+  oneModelCsvDownload: document.querySelector("#one-model-csv-download"),
+  oneModelBatchStatus: document.querySelector("#one-model-batch-status"),
+  oneModelBatchMeta: document.querySelector("#one-model-batch-meta"),
+  oneModelPause: document.querySelector("#one-model-pause"),
+  oneModelCancel: document.querySelector("#one-model-cancel"),
+  oneModelResultRows: document.querySelector("#one-model-result-rows"),
 };
-
-function workspaceSnapshot() {
-  return {
-    version: workspaceVersion,
-    reference: {
-      name: elements.referenceName.value,
-      baseUrl: elements.referenceUrl.value,
-      manualModel: elements.referenceManualModel.value,
-      methodProfileId: elements.methodProfile.value,
-      models: [...state.referenceModels.entries()].map(([model, selected]) => ({
-        model,
-        selected,
-      })),
-    },
-    settings: {
-      preset: elements.preset.value,
-      concurrencyMode: elements.concurrencyMode.value,
-      concurrency: elements.concurrency.value,
-      requestTimeout: elements.requestTimeout.value,
-      modelTimeout: elements.modelTimeout.value,
-    },
-    targets: targetCards().map((card) => ({
-      name: card.querySelector(".target-name").value,
-      baseUrl: card.querySelector(".target-url").value,
-      manualModel: card.querySelector(".target-manual-model").value,
-      models: [...card.querySelectorAll(".mapping-row")].map((row) => ({
-        model: row.dataset.model,
-        referenceArtifactId: row.querySelector(".mapping-reference").dataset.preferredArtifactId
-          || row.querySelector(".mapping-reference").value,
-        enabled: row.dataset.enabledIntent === "true",
-        priority: Number(row.querySelector(".mapping-priority").value) || 50,
-        source: row.dataset.modelSource || "retained",
-      })),
-    })),
-  };
-}
 
 function setWorkspaceStatus(message) {
   if (elements.workspaceStatus) elements.workspaceStatus.textContent = message;
@@ -153,64 +174,18 @@ function setWorkspaceStatus(message) {
 
 function saveWorkspaceNow() {
   if (restoringWorkspace) return;
-  try {
-    localStorage.setItem(workspaceStorageKey, JSON.stringify(workspaceSnapshot()));
-    setWorkspaceStatus("工作区已自动保存");
-  } catch {
-    setWorkspaceStatus("浏览器未允许保存工作区");
-  }
+  setWorkspaceStatus("配置仅保留在当前页面 · Key 不写浏览器存储");
 }
 
 function scheduleWorkspaceSave() {
   if (restoringWorkspace) return;
-  setWorkspaceStatus("正在保存工作区…");
-  window.clearTimeout(workspaceSaveTimer);
-  workspaceSaveTimer = window.setTimeout(saveWorkspaceNow, 250);
+  saveWorkspaceNow();
 }
 
 function restoreWorkspace() {
-  let saved;
-  try {
-    saved = JSON.parse(localStorage.getItem(workspaceStorageKey) || "null");
-  } catch {
-    return false;
-  }
-  if (!saved || saved.version !== workspaceVersion) return false;
-
-  elements.referenceName.value = saved.reference?.name || "";
-  elements.referenceUrl.value = saved.reference?.baseUrl || "";
-  elements.referenceManualModel.value = saved.reference?.manualModel || "";
-  elements.methodProfile.value = relayProfiles.normalizeProfileId(
-    saved.reference?.methodProfileId,
-  );
-  state.referenceModels.clear();
-  (saved.reference?.models || []).forEach((item) => {
-    if (item?.model) state.referenceModels.set(item.model, Boolean(item.selected));
-  });
-  if (presets[saved.settings?.preset]) elements.preset.value = saved.settings.preset;
-  // v1 工作区原先没有并发策略；缺字段必须保持原来的固定并发语义。
-  elements.concurrencyMode.value = saved.settings?.concurrencyMode === "auto" ? "auto" : "fixed";
-  if (saved.settings?.concurrency) elements.concurrency.value = saved.settings.concurrency;
-  if (saved.settings?.requestTimeout) elements.requestTimeout.value = saved.settings.requestTimeout;
-  if (saved.settings?.modelTimeout) elements.modelTimeout.value = saved.settings.modelTimeout;
-
-  elements.targetList.replaceChildren();
-  state.targetSequence = 0;
-  (saved.targets || []).forEach((target) => {
-    const card = addTarget({ name: target.name, baseUrl: target.baseUrl });
-    card.querySelector(".target-manual-model").value = target.manualModel || "";
-    (target.models || []).forEach((item) => {
-      addTargetModel(card, item.model, {
-        referenceArtifactId: item.referenceArtifactId,
-        enabled: item.enabled,
-        priority: item.priority,
-        source: item.source,
-      });
-    });
-  });
-  renderReferenceModelPicker();
-  setWorkspaceStatus("已恢复上次工作区 · Key 未保存");
-  return true;
+  // Deliberately fail closed: form values, URLs, model mappings and credentials
+  // are not reconstructed from any browser persistence API.
+  return false;
 }
 
 function seedDefaultWorkspace() {
@@ -394,7 +369,10 @@ function setBusy(busy, source = "transient") {
   document.querySelectorAll("button, input, select").forEach((node) => {
     node.disabled = anyBusy && node.dataset.allowBusy !== "true";
   });
-  if (!anyBusy) updateControls();
+  if (!anyBusy) {
+    updateControls();
+    updateOneModelTargetValidation();
+  }
 }
 
 function normalizeReference(item) {
@@ -2266,6 +2244,1104 @@ async function prioritizeComparisonTask(auditId, button) {
   }
 }
 
+const oneModelTerminalStatuses = new Set([
+  "completed",
+  "failed",
+  "canceled",
+  "interrupted",
+]);
+const referenceSetTerminalStatuses = new Set([
+  "ready",
+  "failed",
+  "canceled",
+  "interrupted",
+]);
+const exploratoryLabels = Object.freeze({
+  exploratory_reference_like: "相对参考相似",
+  exploratory_reference_deviation: "偏离参考",
+  inconclusive: "区间重叠",
+  insufficient_quality: "质量不足",
+  unsupported_protocol: "协议不兼容",
+  request_failed: "请求失败",
+});
+const safeResultReasonCodes = new Set([
+  "all_target_lower_bounds_above_reference_envelope",
+  "all_target_upper_bounds_within_reference_envelope",
+  "authentication_failed",
+  "batch_canceled",
+  "batch_scheduler_failed",
+  "batch_wall_clock_timeout",
+  "cell_answer_counts_invalid",
+  "cell_coverage_mismatch",
+  "cell_total_count_mismatch",
+  "cell_valid_count_mismatch",
+  "credential_echo_detected",
+  "credential_lost_after_restart",
+  "fingerprint_incomplete",
+  "minimum_valid_samples_per_cell_not_met",
+  "missing_credential",
+  "network",
+  "partial_fingerprint",
+  "reasoning_contamination",
+  "redirect_forbidden",
+  "request_failed",
+  "scheduler_incomplete",
+  "service_shutdown",
+  "station_wall_clock_timeout",
+  "target_fingerprint_missing",
+  "target_intervals_overlap_reference_envelope",
+  "timeout",
+  "unsupported_protocol",
+  "upstream_unavailable",
+]);
+const safeProgressStages = new Set([
+  "queued",
+  "preflight",
+  "sampling",
+  "comparing",
+  "paused",
+  "canceling",
+  "completed",
+  "failed",
+  "canceled",
+  "interrupted",
+]);
+
+function firstDefined(...values) {
+  return values.find((value) => value !== undefined && value !== null && value !== "");
+}
+
+function finiteNumber(...values) {
+  const value = firstDefined(...values);
+  const number = Number(value);
+  return value === undefined || !Number.isFinite(number) ? null : number;
+}
+
+function directnessLabel(...values) {
+  const value = firstDefined(...values);
+  if (value === undefined) return null;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) return numeric.toFixed(2);
+  const text = String(value).trim();
+  return text ? text.slice(0, 32) : null;
+}
+
+function safeApiError(error, fallback) {
+  const status = Number(error?.status);
+  if (Number.isInteger(status)) return `${fallback}（HTTP ${status}）`;
+  return fallback;
+}
+
+function setInlineMessage(element, message, kind = "") {
+  if (!element) return;
+  element.textContent = message;
+  element.className = `inline-message${kind ? ` is-${kind}` : ""}`;
+}
+
+function setOneModelQuery(name, value) {
+  const url = new URL(window.location.href);
+  if (value) url.searchParams.set(name, value);
+  else url.searchParams.delete(name);
+  window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+}
+
+function queryUuid(name) {
+  const value = new URL(window.location.href).searchParams.get(name) || "";
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value)
+    ? value
+    : "";
+}
+
+function clearReferenceSetSecrets() {
+  if (elements.referenceSetKey) elements.referenceSetKey.value = "";
+}
+
+function clearOneModelSecrets() {
+  elements.oneModelTargetRows?.querySelectorAll(".one-model-target-credential").forEach((input) => {
+    input.value = "";
+  });
+  if (elements.oneModelTsv) elements.oneModelTsv.value = "";
+}
+
+function syncReferenceSetForm() {
+  const protocol = elements.referenceProtocol.value;
+  const ephemeral = elements.referenceCredentialMode.value === "ephemeral";
+  elements.referenceTransportProfile.value = relayProfiles.transportProfileForProtocol(protocol);
+  elements.referenceEphemeralWrap.classList.toggle("hidden", !ephemeral);
+  elements.referenceEnvWrap.classList.toggle("hidden", ephemeral);
+  elements.referenceSetKey.required = ephemeral;
+  elements.referenceSetEnv.required = !ephemeral;
+  elements.anthropicWorkspaceWrap.classList.toggle("hidden", protocol !== "anthropic_messages");
+  if (protocol !== "anthropic_messages") elements.anthropicWorkspaceId.value = "";
+}
+
+function referenceSetCredential() {
+  if (elements.referenceCredentialMode.value === "ephemeral") {
+    const apiKey = elements.referenceSetKey.value.trim();
+    if (!apiKey) throw new Error("请输入临时 API Key");
+    return { mode: "ephemeral", api_key: apiKey };
+  }
+  const name = elements.referenceSetEnv.value.trim();
+  if (!/^[A-Z_][A-Z0-9_]{0,99}$/.test(name)) {
+    throw new Error("环境变量名必须是白名单中的大写名称");
+  }
+  return { mode: "env_ref", name };
+}
+
+function normalizeReferenceSet(value) {
+  const wrapper = value?.reference_set || value?.referenceSet || value?.item || value || {};
+  const members = value?.members || wrapper.members || [];
+  const statistics = wrapper.pairwise_statistics
+    || wrapper.pairwiseStatistics
+    || value?.pairwise_statistics
+    || value?.pairwiseStatistics
+    || null;
+  return {
+    id: String(firstDefined(wrapper.id, wrapper.reference_set_id, value?.reference_set_id) || ""),
+    status: String(firstDefined(wrapper.status, "unknown")),
+    selectable: firstDefined(wrapper.selectable, value?.selectable) === true,
+    evidenceIntegrity: String(firstDefined(
+      wrapper.evidence_integrity,
+      wrapper.evidenceIntegrity,
+      value?.evidence_integrity,
+      value?.evidenceIntegrity,
+      "unknown",
+    )),
+    name: String(firstDefined(wrapper.reference_name, wrapper.referenceName, "未命名参考集")),
+    sourceType: String(firstDefined(wrapper.source_type, wrapper.sourceType, "trusted_relay")),
+    protocol: String(firstDefined(wrapper.protocol, "")),
+    profile: String(firstDefined(wrapper.transport_profile_id, wrapper.transportProfileId, "")),
+    logicalModel: String(firstDefined(wrapper.logical_model, wrapper.logicalModel, "")),
+    actualModel: String(firstDefined(wrapper.actual_model, wrapper.actualModel, "")),
+    baseUrl: String(firstDefined(wrapper.normalized_base_url, wrapper.normalizedBaseUrl, "")),
+    manifestSha256: String(firstDefined(
+      wrapper.immutable_manifest_sha256,
+      wrapper.immutableManifestSha256,
+      "",
+    )),
+    referenceEnvelope: finiteNumber(
+      wrapper.reference_envelope,
+      wrapper.referenceEnvelope,
+      statistics?.referenceEnvelope,
+      statistics?.reference_envelope,
+    ),
+    statistics,
+    members: Array.isArray(members) ? members : [],
+    createdAt: firstDefined(wrapper.created_at, wrapper.createdAt),
+    completedAt: firstDefined(wrapper.completed_at, wrapper.completedAt),
+  };
+}
+
+function referenceMemberProgress(member) {
+  const done = finiteNumber(member?.progress_done, member?.progressDone, member?.done) || 0;
+  const total = finiteNumber(member?.progress_total, member?.progressTotal, member?.total) || 1200;
+  return { done: Math.max(0, done), total: Math.max(1, total) };
+}
+
+function renderReferenceSetMembers(referenceSet) {
+  elements.referenceSetMembers.replaceChildren();
+  const membersByOrdinal = new Map(
+    referenceSet.members.map((member, index) => [Number(member.ordinal) || index + 1, member]),
+  );
+  for (let ordinal = 1; ordinal <= 3; ordinal += 1) {
+    const member = membersByOrdinal.get(ordinal) || { ordinal, status: "queued" };
+    const progress = referenceMemberProgress(member);
+    const article = document.createElement("article");
+    article.className = "reference-member";
+
+    const heading = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = `成员 ${ordinal}`;
+    const status = document.createElement("span");
+    status.className = `badge badge-${String(member.status || "queued")}`;
+    status.textContent = verdictLabels[member.status] || member.status || "等待采集";
+    heading.append(title, status);
+
+    const track = document.createElement("div");
+    track.className = "reference-member-track";
+    const bar = document.createElement("i");
+    bar.style.width = `${Math.min(100, (progress.done / progress.total) * 100)}%`;
+    track.append(bar);
+
+    const counts = document.createElement("small");
+    const retries = finiteNumber(member.retry_count, member.retryCount) || 0;
+    const errors = finiteNumber(member.error_count, member.errorCount) || 0;
+    const quality = member.quality || {};
+    const valid = finiteNumber(quality.validSamples, quality.valid_samples);
+    const directness = directnessLabel(quality.directness);
+    counts.textContent = [
+      `${progress.done.toLocaleString()} / ${progress.total.toLocaleString()}`,
+      valid === null ? "" : `${valid.toLocaleString()} valid`,
+      directness === null ? "" : `direct ${directness}`,
+      `重试 ${retries}`,
+      `错误 ${errors}`,
+    ].filter(Boolean).join(" · ");
+    article.append(heading, track, counts);
+
+    [
+      ["Fingerprint SHA-256", firstDefined(member.artifact_sha256, member.artifactSha256)],
+      ["Raw JSONL SHA-256", firstDefined(member.raw_evidence_sha256, member.rawEvidenceSha256)],
+    ].forEach(([label, hash]) => {
+      if (!hash) return;
+      const line = document.createElement("p");
+      const labelNode = document.createElement("span");
+      const code = document.createElement("code");
+      labelNode.textContent = label;
+      code.textContent = String(hash);
+      line.append(labelNode, code);
+      article.append(line);
+    });
+    elements.referenceSetMembers.append(article);
+  }
+}
+
+function pairwiseComparisons(referenceSet) {
+  const statistics = referenceSet.statistics || {};
+  const comparisons = statistics.pairwiseComparisons || statistics.pairwise_comparisons || [];
+  return Array.isArray(comparisons) ? comparisons : [];
+}
+
+function renderReferenceSetDistances(referenceSet) {
+  elements.referenceSetDistances.replaceChildren();
+  const comparisons = pairwiseComparisons(referenceSet);
+  if (!comparisons.length) {
+    const pending = document.createElement("p");
+    pending.textContent = "三轮完成后计算成员间 JSD 与 95% bootstrap 区间。";
+    elements.referenceSetDistances.append(pending);
+    return;
+  }
+  const title = document.createElement("strong");
+  title.textContent = "参考内部距离";
+  elements.referenceSetDistances.append(title);
+  comparisons.forEach((comparison) => {
+    const row = document.createElement("div");
+    const left = firstDefined(comparison.leftMemberOrdinal, comparison.left_member_ordinal, "?");
+    const right = firstDefined(comparison.rightMemberOrdinal, comparison.right_member_ordinal, "?");
+    const mean = finiteNumber(comparison.meanJsdBase2, comparison.mean_jsd_base2);
+    const interval = comparison.confidenceInterval95 || comparison.confidence_interval_95 || {};
+    const lower = finiteNumber(interval.lower);
+    const upper = finiteNumber(interval.upper);
+    row.textContent = `成员 ${left} ↔ ${right}: JSD ${formatNumber(mean, 6)} · 95% CI ${formatNumber(lower, 6)}–${formatNumber(upper, 6)}`;
+    elements.referenceSetDistances.append(row);
+  });
+  const envelope = document.createElement("p");
+  envelope.className = "reference-envelope";
+  envelope.textContent = `探索性 reference envelope：${formatNumber(referenceSet.referenceEnvelope, 6)}`;
+  elements.referenceSetDistances.append(envelope);
+}
+
+function renderActiveReferenceSet(referenceSet) {
+  if (!referenceSet?.id) return;
+  state.activeReferenceSetId = referenceSet.id;
+  state.activeReferenceSetStatus = referenceSet.status;
+  elements.referenceSetProgress.classList.remove("hidden");
+  elements.referenceSetProgressTitle.textContent = `${referenceSet.name} · ${verdictLabels[referenceSet.status] || referenceSet.status}`;
+  elements.referenceSetProgressMeta.textContent = [
+    `${referenceSet.protocol || "未知协议"}`,
+    `${referenceSet.actualModel || "未知模型"}`,
+    `创建 ${formatDate(referenceSet.createdAt)}`,
+  ].join(" · ");
+  renderReferenceSetMembers(referenceSet);
+  renderReferenceSetDistances(referenceSet);
+  const terminal = referenceSetTerminalStatuses.has(referenceSet.status);
+  elements.referenceSetPause.classList.toggle("hidden", terminal);
+  elements.referenceSetCancel.classList.toggle("hidden", terminal);
+  elements.referenceSetPause.disabled = false;
+  elements.referenceSetCancel.disabled = false;
+  elements.referenceSetPause.textContent = referenceSet.status === "paused" ? "恢复" : "暂停";
+  if (referenceSet.manifestSha256) {
+    const suffix = document.createElement("p");
+    suffix.className = "reference-manifest-hash";
+    const label = document.createElement("span");
+    const code = document.createElement("code");
+    label.textContent = "冻结 manifest SHA-256";
+    code.textContent = referenceSet.manifestSha256;
+    suffix.append(label, code);
+    elements.referenceSetDistances.append(suffix);
+  }
+  if (terminal) {
+    window.clearTimeout(state.referenceSetPollTimer);
+    state.referenceSetPollTimer = null;
+    loadReferenceSets({ quiet: true });
+  }
+}
+
+function referenceSetCard(referenceSet) {
+  const article = document.createElement("article");
+  article.className = `ready-reference-card${referenceSet.selectable ? " is-ready" : ""}`;
+  const heading = document.createElement("div");
+  const title = document.createElement("strong");
+  title.textContent = referenceSet.name;
+  const status = document.createElement("span");
+  status.className = `badge badge-${referenceSet.status}`;
+  status.textContent = referenceSet.selectable
+    ? "READY"
+    : referenceSet.status === "ready"
+      ? "证据不可选"
+      : (verdictLabels[referenceSet.status] || referenceSet.status);
+  heading.append(title, status);
+  const meta = document.createElement("p");
+  meta.textContent = `${referenceSet.sourceType === "official_api" ? "用户声明：官方 API" : "用户声明：可信中转"} · ${referenceSet.protocol} · ${referenceSet.actualModel}`;
+  const time = document.createElement("small");
+  time.textContent = `${formatDate(referenceSet.createdAt)} · evidence ${referenceSet.evidenceIntegrity} · envelope ${formatNumber(referenceSet.referenceEnvelope, 6)}`;
+  const hash = document.createElement("code");
+  hash.textContent = referenceSet.manifestSha256 || "manifest hash 待生成";
+  article.append(heading, meta, time, hash);
+  if (referenceSet.selectable) {
+    const choose = document.createElement("button");
+    choose.type = "button";
+    choose.className = "button button-ghost";
+    choose.textContent = elements.oneModelReferenceSelect.value === referenceSet.id ? "已选择" : "用于下一批";
+    choose.addEventListener("click", () => {
+      elements.oneModelReferenceSelect.value = referenceSet.id;
+      setOneModelQuery("reference_set_id", referenceSet.id);
+      renderReferenceSetLibrary();
+      updateOneModelTargetValidation();
+    });
+    article.append(choose);
+  }
+  return article;
+}
+
+function renderReferenceSetLibrary() {
+  elements.readyReferenceSets.replaceChildren();
+  if (!state.referenceSets.length) {
+    const empty = document.createElement("div");
+    empty.className = "compact-empty";
+    const title = document.createElement("strong");
+    const copy = document.createElement("p");
+    title.textContent = "暂无 ReferenceSet";
+    copy.textContent = "完成三轮采集并通过完整性验证后才能用于比较。";
+    empty.append(title, copy);
+    elements.readyReferenceSets.append(empty);
+  } else {
+    state.referenceSets.forEach((item) => elements.readyReferenceSets.append(referenceSetCard(item)));
+  }
+
+  const selected = elements.oneModelReferenceSelect.value || queryUuid("reference_set_id");
+  const ready = state.referenceSets.filter((item) => item.selectable);
+  elements.oneModelReferenceSelect.replaceChildren();
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = ready.length ? "选择三成员 ReferenceSet" : "暂无 ready ReferenceSet";
+  elements.oneModelReferenceSelect.append(placeholder);
+  ready.forEach((item) => {
+    const option = document.createElement("option");
+    option.value = item.id;
+    option.textContent = `${item.name} · ${item.protocol} · ${item.actualModel}`;
+    elements.oneModelReferenceSelect.append(option);
+  });
+  if (ready.some((item) => item.id === selected)) elements.oneModelReferenceSelect.value = selected;
+  updateOneModelTargetValidation();
+}
+
+async function loadReferenceSets({ quiet = false } = {}) {
+  try {
+    const body = await requestJson("/api/v1/console/reference-sets");
+    const items = Array.isArray(body?.items) ? body.items : Array.isArray(body) ? body : [];
+    state.referenceSets = items.map(normalizeReferenceSet).filter((item) => item.id);
+    elements.oneModelApiStatus.textContent = "新批次 API 已连接";
+    elements.oneModelApiStatus.className = "badge badge-running";
+    renderReferenceSetLibrary();
+    return true;
+  } catch (error) {
+    state.referenceSets = [];
+    renderReferenceSetLibrary();
+    elements.oneModelApiStatus.textContent = error?.status === 404 ? "新批次 API 尚未启用" : "新批次 API 连接失败";
+    elements.oneModelApiStatus.className = "badge badge-muted";
+    if (!quiet) {
+      setInlineMessage(
+        elements.referenceSetFormMessage,
+        safeApiError(error, "无法读取 ReferenceSet"),
+        "error",
+      );
+    }
+    return false;
+  }
+}
+
+function scheduleReferenceSetPoll(delay = 1200) {
+  window.clearTimeout(state.referenceSetPollTimer);
+  if (!state.activeReferenceSetId || referenceSetTerminalStatuses.has(state.activeReferenceSetStatus)) return;
+  state.referenceSetPollTimer = window.setTimeout(pollReferenceSet, delay);
+}
+
+async function pollReferenceSet() {
+  if (!state.activeReferenceSetId) return;
+  try {
+    const body = await requestJson(`/api/v1/console/reference-sets/${state.activeReferenceSetId}`);
+    const referenceSet = normalizeReferenceSet(body);
+    renderActiveReferenceSet(referenceSet);
+    if (!referenceSetTerminalStatuses.has(referenceSet.status)) scheduleReferenceSetPoll();
+  } catch (error) {
+    elements.referenceSetProgressTitle.textContent = safeApiError(error, "参考集状态暂时不可读取");
+    scheduleReferenceSetPoll(3500);
+  }
+}
+
+async function createReferenceSet(event) {
+  event.preventDefault();
+  setInlineMessage(elements.referenceSetFormMessage, "");
+  let credential;
+  let normalizedUrl;
+  try {
+    credential = referenceSetCredential();
+    normalizedUrl = relayProfiles.normalizeOneModelBaseUrl(elements.referenceSetUrl.value);
+    if (!normalizedUrl.valid) throw new Error(normalizedUrl.error);
+  } catch (error) {
+    setInlineMessage(elements.referenceSetFormMessage, error.message, "error");
+    return;
+  }
+  const protocol = elements.referenceProtocol.value;
+  const payload = {
+    reference_name: elements.referenceSetName.value.trim(),
+    source_type: elements.referenceSourceType.value,
+    protocol,
+    transport_profile_id: relayProfiles.transportProfileForProtocol(protocol),
+    logical_model: elements.referenceLogicalModel.value.trim(),
+    actual_model: elements.referenceActualModel.value.trim(),
+    base_url: normalizedUrl.value,
+    credential,
+    anthropic_workspace_id: protocol === "anthropic_messages"
+      ? elements.anthropicWorkspaceId.value.trim() || null
+      : null,
+    cell_count: 40,
+    samples_per_cell: 30,
+    member_count: 3,
+    concurrency: 3,
+    request_timeout_seconds: 30,
+    member_timeout_seconds: 7200,
+  };
+  elements.referenceSetUrl.value = normalizedUrl.value;
+  elements.referenceSetForm.querySelector("button[type='submit']").disabled = true;
+  setInlineMessage(elements.referenceSetFormMessage, "正在提交；临时 Key 已从页面清空…", "info");
+  const pending = postJson("/api/v1/console/reference-sets", payload);
+  clearReferenceSetSecrets();
+  credential = null;
+  payload.credential = null;
+  try {
+    const body = await pending;
+    const referenceSet = normalizeReferenceSet(body);
+    if (!referenceSet.id) throw new Error("missing_reference_set_id");
+    setOneModelQuery("reference_set_id", referenceSet.id);
+    setInlineMessage(elements.referenceSetFormMessage, "ReferenceSet 已创建；三轮将依次采集。", "success");
+    renderActiveReferenceSet(referenceSet);
+    await loadReferenceSets({ quiet: true });
+    scheduleReferenceSetPoll();
+  } catch (error) {
+    setInlineMessage(elements.referenceSetFormMessage, safeApiError(error, "ReferenceSet 创建失败"), "error");
+  } finally {
+    elements.referenceSetForm.querySelector("button[type='submit']").disabled = false;
+  }
+}
+
+async function pauseOrResumeReferenceSet() {
+  if (!state.activeReferenceSetId) return;
+  const action = state.activeReferenceSetStatus === "paused" ? "resume" : "pause";
+  elements.referenceSetPause.disabled = true;
+  try {
+    const body = await postJson(
+      `/api/v1/console/reference-sets/${state.activeReferenceSetId}/${action}`,
+      {},
+    );
+    renderActiveReferenceSet(normalizeReferenceSet(body));
+    scheduleReferenceSetPoll();
+  } catch (error) {
+    elements.referenceSetProgressTitle.textContent = safeApiError(error, "参考集操作失败");
+    elements.referenceSetPause.disabled = false;
+  }
+}
+
+async function cancelReferenceSet() {
+  if (!state.activeReferenceSetId || !window.confirm("取消三轮参考采集？已完成证据会保留，但该组不能用于后续批次。")) return;
+  elements.referenceSetCancel.disabled = true;
+  try {
+    const body = await postJson(
+      `/api/v1/console/reference-sets/${state.activeReferenceSetId}/cancel`,
+      {},
+    );
+    renderActiveReferenceSet(normalizeReferenceSet(body));
+  } catch (error) {
+    elements.referenceSetProgressTitle.textContent = safeApiError(error, "取消参考集失败");
+    elements.referenceSetCancel.disabled = false;
+  }
+}
+
+function oneModelRowsFromDom() {
+  return [...elements.oneModelTargetRows.querySelectorAll("tr[data-one-model-row]")].map(
+    (row, index) => ({
+      sourceRow: index + 1,
+      stationName: row.querySelector(".one-model-target-name").value,
+      baseUrl: row.querySelector(".one-model-target-url").value,
+      credentialText: row.querySelector(".one-model-target-credential").value,
+      modelId: row.querySelector(".one-model-target-model").value,
+      element: row,
+    }),
+  );
+}
+
+function oneModelConcurrencySettings() {
+  const maxStations = Number(elements.oneModelMaxStations.value);
+  const perStation = Number(elements.oneModelPerStation.value);
+  const global = Number(elements.oneModelGlobalConcurrency.value);
+  if (!Number.isInteger(maxStations) || maxStations < 1 || maxStations > 8) {
+    return { valid: false, error: "并行站点必须为 1–8" };
+  }
+  if (!Number.isInteger(perStation) || perStation < 1 || perStation > 4) {
+    return { valid: false, error: "每站并发必须为 1–4" };
+  }
+  if (!Number.isInteger(global) || global < 1 || global > 16) {
+    return { valid: false, error: "全局并发必须为 1–16" };
+  }
+  if (global > maxStations * perStation) {
+    return { valid: false, error: "全局并发不能超过“并行站点 × 每站并发”" };
+  }
+  return {
+    valid: true,
+    value: {
+      max_parallel_stations: maxStations,
+      per_station_concurrency: perStation,
+      global_request_concurrency: global,
+    },
+  };
+}
+
+function addOneModelTargetRow(values = {}) {
+  const currentCount = elements.oneModelTargetRows.querySelectorAll("tr[data-one-model-row]").length;
+  if (currentCount >= 20) {
+    setInlineMessage(elements.oneModelImportMessage, "单批最多 20 个中转站。", "error");
+    return null;
+  }
+  state.oneModelTargetSequence += 1;
+  const row = document.createElement("tr");
+  row.dataset.oneModelRow = String(state.oneModelTargetSequence);
+
+  const numberCell = document.createElement("td");
+  numberCell.className = "one-model-row-number";
+
+  const inputDefinitions = [
+    ["stationName", "one-model-target-name", "站点名称", "text"],
+    ["baseUrl", "one-model-target-url", "https://relay.example/v1", "url"],
+    ["credentialText", "one-model-target-credential api-key", "API Key 或 env:NAME", "password"],
+    ["modelId", "one-model-target-model", "留空使用默认模型", "text"],
+  ];
+  inputDefinitions.forEach(([key, className, placeholder, type]) => {
+    const cell = document.createElement("td");
+    const input = document.createElement("input");
+    input.type = type;
+    input.className = className;
+    input.placeholder = placeholder;
+    input.autocomplete = type === "password" ? "new-password" : "off";
+    input.spellcheck = false;
+    input.value = String(values[key] || "");
+    if (key === "stationName") input.maxLength = 80;
+    if (key === "modelId") input.maxLength = 255;
+    input.addEventListener("input", updateOneModelTargetValidation);
+    if (key === "baseUrl") {
+      input.addEventListener("blur", () => updateOneModelTargetValidation({ normalizeUrls: true }));
+    }
+    cell.append(input);
+    row.append(cell);
+  });
+
+  const statusCell = document.createElement("td");
+  statusCell.className = "one-model-row-validation";
+  statusCell.textContent = "待校验";
+  const actionCell = document.createElement("td");
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "icon-button one-model-remove-target";
+  remove.setAttribute("aria-label", "移除目标站");
+  remove.textContent = "×";
+  remove.addEventListener("click", () => {
+    row.querySelector(".one-model-target-credential").value = "";
+    row.remove();
+    updateOneModelTargetValidation();
+  });
+  actionCell.append(remove);
+  row.prepend(numberCell);
+  row.append(statusCell, actionCell);
+  elements.oneModelTargetRows.append(row);
+  updateOneModelTargetValidation();
+  return row;
+}
+
+function updateOneModelTargetValidation(options = {}) {
+  if (!elements.oneModelTargetRows) return { valid: false, targets: [], errors: [] };
+  const rows = oneModelRowsFromDom();
+  rows.forEach((row, index) => {
+    row.element.querySelector(".one-model-row-number").textContent = String(index + 1);
+    if (options.normalizeUrls) {
+      const normalized = relayProfiles.normalizeOneModelBaseUrl(row.baseUrl);
+      if (normalized.valid) {
+        row.element.querySelector(".one-model-target-url").value = normalized.value;
+        row.baseUrl = normalized.value;
+      }
+    }
+  });
+  const validation = relayProfiles.validateOneModelTargets(rows, elements.oneModelDefaultModel.value);
+  const errorsByRow = new Map();
+  validation.errors.forEach((error) => {
+    if (!error.row) return;
+    if (!errorsByRow.has(error.row)) errorsByRow.set(error.row, []);
+    errorsByRow.get(error.row).push(error.message);
+  });
+  rows.forEach((row, index) => {
+    const status = row.element.querySelector(".one-model-row-validation");
+    const errors = errorsByRow.get(index + 1) || [];
+    row.element.classList.toggle("is-invalid", errors.length > 0);
+    row.element.classList.toggle("is-valid", !errors.length);
+    status.textContent = errors.length ? errors.join("；") : "可提交";
+  });
+  const concurrency = oneModelConcurrencySettings();
+  const globalError = validation.errors.find((error) => !error.row)?.message || concurrency.error || "";
+  const rowErrorCount = validation.errors.filter((error) => error.row).length;
+  if (!rows.length && concurrency.valid) {
+    setInlineMessage(elements.oneModelImportMessage, "粘贴 TSV 或添加空行；凭据只保留在当前输入框。", "");
+  } else if (globalError) {
+    setInlineMessage(elements.oneModelImportMessage, globalError, "error");
+  } else if (rowErrorCount) {
+    setInlineMessage(elements.oneModelImportMessage, `有 ${rowErrorCount} 项逐行校验错误，请按红色提示修正。`, "error");
+  } else if (rows.length) {
+    setInlineMessage(elements.oneModelImportMessage, `已校验 ${rows.length} 行；凭据不会写入浏览器存储。`, "success");
+  } else {
+    setInlineMessage(elements.oneModelImportMessage, "");
+  }
+  const estimate = relayProfiles.oneModelRequestEstimate(rows.length);
+  elements.oneModelTargetCount.textContent = `${rows.length} / 20`;
+  elements.oneModelTargetEstimate.textContent = estimate.targetRequests.toLocaleString();
+  elements.oneModelTotalEstimate.textContent = estimate.totalRequests.toLocaleString();
+  elements.runOneModelBatch.disabled = !(
+    validation.valid
+    && concurrency.valid
+    && elements.oneModelReferenceSelect.value
+  );
+  // Routine validation never retains a second copy of any plaintext credential.
+  if (!options.keepTargets) {
+    validation.targets.forEach((target) => { target.credential = null; });
+    validation.targets.length = 0;
+  }
+  return validation;
+}
+
+function importOneModelTsv() {
+  const parsed = relayProfiles.parseOneModelTsv(elements.oneModelTsv.value);
+  if (parsed.errors.length) {
+    const message = parsed.errors.map((error) => (
+      `${error.row ? `第 ${error.row} 行：` : ""}${error.message}`
+    )).join("；");
+    setInlineMessage(elements.oneModelImportMessage, message, "error");
+    return;
+  }
+  clearOneModelSecrets();
+  elements.oneModelTargetRows.replaceChildren();
+  state.oneModelTargetSequence = 0;
+  parsed.rows.forEach((row) => addOneModelTargetRow(row));
+  parsed.rows.forEach((row) => { row.credentialText = ""; });
+  elements.oneModelTsv.value = "";
+  updateOneModelTargetValidation({ normalizeUrls: true });
+}
+
+function clearOneModelTargets() {
+  clearOneModelSecrets();
+  elements.oneModelTargetRows.replaceChildren();
+  state.oneModelTargetSequence = 0;
+  updateOneModelTargetValidation();
+}
+
+function safeReasonCodes(...sources) {
+  const values = sources.flatMap((source) => (
+    Array.isArray(source) ? source : source === undefined || source === null ? [] : [source]
+  ));
+  return [...new Set(values
+    .map((value) => String(value).trim())
+    .filter((value) => safeResultReasonCodes.has(value)))]
+    .slice(0, 8);
+}
+
+function normalizeOneModelItem(item, index) {
+  const result = item?.result || item?.comparison || item || {};
+  const quality = item?.quality || result?.metrics || result?.quality || {};
+  const distances = result?.distances || item?.distances || {};
+  const distanceMembers = Array.isArray(distances)
+    ? distances
+    : Array.isArray(distances?.members) ? distances.members : [];
+  const means = distanceMembers.length
+    ? distanceMembers.map((distance) => finiteNumber(
+      distance.meanJsdBase2,
+      distance.mean_jsd_base2,
+      distance.mean_jsd,
+    )).filter((value) => value !== null)
+    : [];
+  const status = String(firstDefined(item?.status, result?.execution_status, "queued"));
+  const exploratoryStatus = String(firstDefined(
+    item?.exploratory_status,
+    item?.exploratoryStatus,
+    result?.status,
+    result?.exploratory_status,
+    "",
+  ));
+  const reasonCodes = safeReasonCodes(
+    item?.safe_error_code,
+    item?.safeErrorCode,
+    result?.reasonCodes,
+    result?.reason_codes,
+    result?.error?.code,
+    quality?.reasonCodes,
+    quality?.reason_codes,
+  );
+  return {
+    sequence: finiteNumber(item?.sequence) ?? index,
+    rowId: String(firstDefined(item?.row_id, item?.rowId, `row-${index + 1}`)),
+    stationName: String(firstDefined(item?.station_name, item?.stationName, "未命名中转站")),
+    model: String(firstDefined(item?.model, item?.model_id, item?.modelId, "")),
+    reportedModel: String(firstDefined(
+      item?.reported_model,
+      item?.reportedModel,
+      result?.reported_model,
+      result?.reportedModel,
+      "",
+    )),
+    status,
+    stage: safeProgressStages.has(String(item?.stage || "")) ? String(item.stage) : "",
+    progressDone: finiteNumber(item?.progress_done, item?.progressDone) || 0,
+    progressTotal: finiteNumber(item?.progress_total, item?.progressTotal) || 1200,
+    exploratoryStatus,
+    medianJsd: finiteNumber(
+      result?.medianMeanJsdBase2,
+      result?.median_mean_jsd_base2,
+      distances?.median_mean_jsd,
+      item?.median_mean_jsd_base2,
+      means.length ? median(means) : undefined,
+    ),
+    coverage: finiteNumber(quality?.cellCoverage, quality?.cell_coverage),
+    sufficientCells: finiteNumber(
+      quality?.sufficientCellCount,
+      quality?.sufficient_cell_count,
+      quality?.coverage_cells,
+    ),
+    cellCount: finiteNumber(quality?.cellCount, quality?.cell_count, quality?.total_cells) || 40,
+    validSamples: finiteNumber(quality?.validSamples, quality?.valid_samples),
+    invalidSamples: finiteNumber(quality?.invalidSamples, quality?.invalid_samples),
+    errorSamples: finiteNumber(quality?.errorSamples, quality?.error_samples),
+    directness: directnessLabel(quality?.directness),
+    splitHalf: finiteNumber(
+      quality?.splitHalf,
+      quality?.split_half,
+      quality?.split_half_mean_jsd,
+    ),
+    latencyP50: finiteNumber(
+      item?.latency_p50_ms,
+      item?.latencyP50Ms,
+      result?.latencyP50Ms,
+      result?.latency?.p50_ms,
+    ),
+    latencyP95: finiteNumber(
+      item?.latency_p95_ms,
+      item?.latencyP95Ms,
+      result?.latencyP95Ms,
+      result?.latency?.p95_ms,
+    ),
+    retries: finiteNumber(item?.retry_count, item?.retryCount, result?.requests?.retries) || 0,
+    errorCount: finiteNumber(item?.error_count, item?.errorCount) || 0,
+    httpStatus: finiteNumber(
+      item?.error_http_status,
+      item?.errorHttpStatus,
+      result?.error?.http_status,
+      result?.preflight?.http_status,
+    ),
+    reasonCodes,
+  };
+}
+
+function normalizeOneModelBatch(value) {
+  const wrapper = value?.batch || value?.one_model_batch || value?.oneModelBatch || value || {};
+  const rawItems = value?.items || wrapper.items || value?.targets || [];
+  return {
+    id: String(firstDefined(wrapper.id, wrapper.batch_id, value?.batch_id) || ""),
+    referenceSetId: String(firstDefined(wrapper.reference_set_id, wrapper.referenceSetId, "")),
+    status: String(firstDefined(wrapper.status, "running")),
+    totalItems: finiteNumber(wrapper.total_items, wrapper.totalItems) || (Array.isArray(rawItems) ? rawItems.length : 0),
+    completedItems: finiteNumber(wrapper.completed_items, wrapper.completedItems) || 0,
+    failedItems: finiteNumber(wrapper.failed_items, wrapper.failedItems) || 0,
+    progressDone: finiteNumber(wrapper.progress_done, wrapper.progressDone) || 0,
+    progressTotal: finiteNumber(wrapper.progress_total, wrapper.progressTotal) || 0,
+    protocol: String(firstDefined(wrapper.protocol, "")),
+    profile: String(firstDefined(wrapper.transport_profile_id, wrapper.transportProfileId, "")),
+    createdAt: firstDefined(wrapper.created_at, wrapper.createdAt),
+    updatedAt: firstDefined(wrapper.updated_at, wrapper.updatedAt),
+    reportSha256: String(firstDefined(wrapper.report_sha256, wrapper.reportSha256, "")),
+    items: Array.isArray(rawItems) ? rawItems.map(normalizeOneModelItem) : [],
+  };
+}
+
+function oneModelStatusLabel(item) {
+  return exploratoryLabels[item.exploratoryStatus]
+    || verdictLabels[item.status]
+    || item.status
+    || "等待执行";
+}
+
+function oneModelQualityLabel(item) {
+  const parts = [];
+  if (item.validSamples !== null) parts.push(`${item.validSamples.toLocaleString()} valid`);
+  if (item.coverage !== null) parts.push(`${(item.coverage * 100).toFixed(0)}% cells`);
+  else if (item.sufficientCells !== null) parts.push(`${item.sufficientCells}/${item.cellCount} cells`);
+  if (item.directness !== null) parts.push(`direct ${item.directness}`);
+  if (item.splitHalf !== null) parts.push(`split ${item.splitHalf.toFixed(2)}`);
+  return parts.join(" · ") || "—";
+}
+
+function oneModelQualityScore(item) {
+  if (item.coverage !== null) return item.coverage;
+  if (item.sufficientCells !== null && item.cellCount) return item.sufficientCells / item.cellCount;
+  if (item.validSamples !== null) return item.validSamples / 1200;
+  return -1;
+}
+
+function oneModelErrorScore(item) {
+  return item.errorCount + (item.errorSamples || 0) + (item.status === "failed" ? 1200 : 0);
+}
+
+function renderOneModelResults() {
+  let items = [...state.oneModelBatchItems];
+  const filter = elements.oneModelResultFilter.value;
+  if (filter === "active") {
+    items = items.filter((item) => !oneModelTerminalStatuses.has(item.status));
+  } else if (filter === "has_error") {
+    items = items.filter((item) => oneModelErrorScore(item) > 0 || [
+      "request_failed",
+      "unsupported_protocol",
+    ].includes(item.exploratoryStatus));
+  } else if (filter) {
+    items = items.filter((item) => item.exploratoryStatus === filter || item.status === filter);
+  }
+  const sort = elements.oneModelResultSort.value;
+  if (sort === "jsd_asc") {
+    items.sort((left, right) => (left.medianJsd ?? Infinity) - (right.medianJsd ?? Infinity));
+  } else if (sort === "quality_desc") {
+    items.sort((left, right) => oneModelQualityScore(right) - oneModelQualityScore(left));
+  } else if (sort === "errors_desc") {
+    items.sort((left, right) => oneModelErrorScore(right) - oneModelErrorScore(left));
+  } else if (sort === "latency_asc") {
+    items.sort((left, right) => (left.latencyP95 ?? Infinity) - (right.latencyP95 ?? Infinity));
+  } else if (sort === "status") {
+    items.sort((left, right) => oneModelStatusLabel(left).localeCompare(oneModelStatusLabel(right), "zh-CN"));
+  } else {
+    items.sort((left, right) => left.sequence - right.sequence);
+  }
+
+  elements.oneModelResultRows.replaceChildren();
+  if (!items.length) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 7;
+    cell.className = "table-empty";
+    cell.textContent = state.oneModelBatchItems.length ? "当前筛选条件下无结果" : "等待批次结果";
+    row.append(cell);
+    elements.oneModelResultRows.append(row);
+    return;
+  }
+
+  items.forEach((item) => {
+    const row = document.createElement("tr");
+    row.className = `one-model-result-row status-${item.exploratoryStatus || item.status}`;
+    const station = document.createElement("td");
+    const stationName = document.createElement("strong");
+    const model = document.createElement("code");
+    const reportedModel = document.createElement("small");
+    const progress = document.createElement("small");
+    stationName.textContent = item.stationName;
+    model.textContent = item.model;
+    reportedModel.textContent = item.reportedModel ? `reported: ${item.reportedModel}` : "reported: —";
+    progress.textContent = `${item.progressDone.toLocaleString()} / ${item.progressTotal.toLocaleString()}`;
+    station.append(stationName, model, reportedModel, progress);
+
+    const status = document.createElement("td");
+    const badge = document.createElement("span");
+    badge.className = `badge badge-${item.exploratoryStatus || item.status}`;
+    badge.textContent = oneModelStatusLabel(item);
+    status.append(badge);
+
+    const quality = document.createElement("td");
+    quality.textContent = oneModelQualityLabel(item);
+    const jsd = document.createElement("td");
+    jsd.className = "numeric-cell";
+    jsd.textContent = formatNumber(item.medianJsd, 6);
+    const latency = document.createElement("td");
+    latency.className = "numeric-cell";
+    latency.textContent = `${formatDuration(item.latencyP50)} / ${formatDuration(item.latencyP95)}`;
+    const retries = document.createElement("td");
+    retries.className = "numeric-cell";
+    retries.textContent = String(item.retries);
+    const reason = document.createElement("td");
+    const reasonParts = [...item.reasonCodes];
+    if (item.httpStatus !== null) reasonParts.push(`HTTP ${item.httpStatus}`);
+    if (item.errorCount || item.errorSamples) {
+      reasonParts.push(`错误 ${item.errorCount + (item.errorSamples || 0)}`);
+    }
+    reason.textContent = reasonParts.join(" · ") || (item.stage || "—");
+    row.append(station, status, quality, jsd, latency, retries, reason);
+    elements.oneModelResultRows.append(row);
+  });
+}
+
+function renderOneModelBatch(value) {
+  const batch = normalizeOneModelBatch(value);
+  if (!batch.id) return;
+  state.oneModelBatchId = batch.id;
+  state.oneModelBatchStatus = batch.status;
+  state.oneModelBatchItems = batch.items;
+  setOneModelQuery("batch_id", batch.id);
+  const terminal = oneModelTerminalStatuses.has(batch.status);
+  const itemTerminalCount = batch.items.filter((item) => oneModelTerminalStatuses.has(item.status)).length;
+  elements.oneModelBatchStatus.textContent = `批次 ${batch.id} · ${verdictLabels[batch.status] || batch.status}`;
+  elements.oneModelBatchMeta.textContent = [
+    `${itemTerminalCount || batch.completedItems + batch.failedItems}/${batch.totalItems} 站终态`,
+    batch.progressTotal ? `${batch.progressDone.toLocaleString()}/${batch.progressTotal.toLocaleString()} samples` : "等待采样",
+    `更新 ${formatDate(batch.updatedAt || batch.createdAt)}`,
+    batch.reportSha256 ? `report SHA-256 ${batch.reportSha256}` : "",
+  ].filter(Boolean).join(" · ");
+  elements.oneModelPause.classList.toggle("hidden", terminal);
+  elements.oneModelCancel.classList.toggle("hidden", terminal);
+  elements.oneModelPause.disabled = false;
+  elements.oneModelCancel.disabled = false;
+  elements.oneModelPause.textContent = batch.status === "paused" ? "恢复" : "暂停";
+  elements.oneModelJsonDownload.classList.toggle("hidden", !terminal);
+  elements.oneModelCsvDownload.classList.toggle("hidden", !terminal);
+  if (terminal) {
+    elements.oneModelJsonDownload.href = `/api/v1/console/one-model-batches/${batch.id}/report.json`;
+    elements.oneModelCsvDownload.href = `/api/v1/console/one-model-batches/${batch.id}/report.csv`;
+    window.clearTimeout(state.oneModelBatchPollTimer);
+    state.oneModelBatchPollTimer = null;
+  }
+  renderOneModelResults();
+}
+
+function scheduleOneModelBatchPoll(delay = 1200) {
+  window.clearTimeout(state.oneModelBatchPollTimer);
+  if (!state.oneModelBatchId || oneModelTerminalStatuses.has(state.oneModelBatchStatus)) return;
+  state.oneModelBatchPollTimer = window.setTimeout(pollOneModelBatch, delay);
+}
+
+async function pollOneModelBatch() {
+  if (!state.oneModelBatchId) return;
+  try {
+    const body = await requestJson(`/api/v1/console/one-model-batches/${state.oneModelBatchId}`);
+    renderOneModelBatch(body);
+    if (!oneModelTerminalStatuses.has(state.oneModelBatchStatus)) scheduleOneModelBatchPoll();
+  } catch (error) {
+    elements.oneModelBatchStatus.textContent = safeApiError(error, "批次状态暂时不可读取");
+    scheduleOneModelBatchPoll(3500);
+  }
+}
+
+async function runOneModelBatch() {
+  const referenceSetId = elements.oneModelReferenceSelect.value;
+  if (!referenceSetId) {
+    setInlineMessage(elements.oneModelImportMessage, "请选择 ready ReferenceSet。", "error");
+    return;
+  }
+  const concurrency = oneModelConcurrencySettings();
+  const validation = updateOneModelTargetValidation({ normalizeUrls: true, keepTargets: true });
+  if (!concurrency.valid || !validation.valid) return;
+  const payload = {
+    reference_set_id: referenceSetId,
+    default_model_id: elements.oneModelDefaultModel.value.trim(),
+    targets: validation.targets,
+    ...concurrency.value,
+    request_timeout_seconds: 30,
+    station_timeout_seconds: 7200,
+    batch_timeout_seconds: 43200,
+    retry_budget: 240,
+  };
+  elements.runOneModelBatch.disabled = true;
+  setInlineMessage(elements.oneModelImportMessage, "正在提交；所有明文 Key 和粘贴区已清空…", "info");
+  const pending = postJson("/api/v1/console/one-model-batches", payload);
+  clearOneModelSecrets();
+  validation.targets.forEach((target) => { target.credential = null; });
+  validation.targets.length = 0;
+  payload.targets = [];
+  try {
+    const body = await pending;
+    const batch = normalizeOneModelBatch(body);
+    if (!batch.id) throw new Error("missing_batch_id");
+    setInlineMessage(elements.oneModelImportMessage, "批次已创建；刷新页面可通过 batch_id 恢复进度。", "success");
+    renderOneModelBatch(body);
+    scheduleOneModelBatchPoll();
+  } catch (error) {
+    setInlineMessage(elements.oneModelImportMessage, safeApiError(error, "批次创建失败；凭据需重新输入"), "error");
+    updateOneModelTargetValidation();
+  }
+}
+
+async function pauseOrResumeOneModelBatch() {
+  if (!state.oneModelBatchId) return;
+  const action = state.oneModelBatchStatus === "paused" ? "resume" : "pause";
+  elements.oneModelPause.disabled = true;
+  try {
+    const body = await postJson(
+      `/api/v1/console/one-model-batches/${state.oneModelBatchId}/${action}`,
+      {},
+    );
+    renderOneModelBatch(body);
+    scheduleOneModelBatchPoll();
+  } catch (error) {
+    elements.oneModelBatchStatus.textContent = safeApiError(error, "批次操作失败");
+    elements.oneModelPause.disabled = false;
+  }
+}
+
+async function cancelOneModelBatch() {
+  if (!state.oneModelBatchId || !window.confirm("取消整个单模型批次？报告仍会包含全部输入行的终态。")) return;
+  elements.oneModelCancel.disabled = true;
+  try {
+    const body = await postJson(
+      `/api/v1/console/one-model-batches/${state.oneModelBatchId}/cancel`,
+      {},
+    );
+    renderOneModelBatch(body);
+    scheduleOneModelBatchPoll();
+  } catch (error) {
+    elements.oneModelBatchStatus.textContent = safeApiError(error, "取消批次失败");
+    elements.oneModelCancel.disabled = false;
+  }
+}
+
+async function initializeOneModelWorkbench() {
+  if (!elements.referenceSetForm) return;
+  syncReferenceSetForm();
+  updateOneModelTargetValidation();
+  await loadReferenceSets({ quiet: true });
+  const referenceSetId = queryUuid("reference_set_id");
+  if (referenceSetId) {
+    try {
+      const body = await requestJson(`/api/v1/console/reference-sets/${referenceSetId}`);
+      const referenceSet = normalizeReferenceSet(body);
+      renderActiveReferenceSet(referenceSet);
+      if (referenceSet.selectable) {
+        elements.oneModelReferenceSelect.value = referenceSet.id;
+        updateOneModelTargetValidation();
+      } else {
+        scheduleReferenceSetPoll();
+      }
+    } catch {
+      // The list panel already shows API availability without reflecting server details.
+    }
+  }
+  const batchId = queryUuid("batch_id");
+  if (batchId) {
+    state.oneModelBatchId = batchId;
+    try {
+      const body = await requestJson(`/api/v1/console/one-model-batches/${batchId}`);
+      renderOneModelBatch(body);
+      scheduleOneModelBatchPoll();
+    } catch (error) {
+      elements.oneModelBatchStatus.textContent = safeApiError(error, "无法恢复 URL 中的批次");
+    }
+  }
+}
+
 async function checkHealth() {
   try {
     const body = await requestJson("/health");
@@ -2304,6 +3380,8 @@ elements.clearKeys.addEventListener("click", () => {
   document.querySelectorAll(".api-key").forEach((input) => {
     input.value = "";
   });
+  if (elements.oneModelTsv) elements.oneModelTsv.value = "";
+  updateOneModelTargetValidation();
 });
 elements.preset.addEventListener("change", updateControls);
 elements.methodProfile.addEventListener("change", updateControls);
@@ -2311,6 +3389,29 @@ elements.concurrencyMode.addEventListener("change", updateControls);
 elements.concurrency.addEventListener("change", updateControls);
 elements.requestTimeout.addEventListener("change", updateControls);
 elements.modelTimeout.addEventListener("change", updateControls);
+elements.referenceSetForm.addEventListener("submit", createReferenceSet);
+elements.referenceProtocol.addEventListener("change", syncReferenceSetForm);
+elements.referenceCredentialMode.addEventListener("change", syncReferenceSetForm);
+elements.refreshReferenceSets.addEventListener("click", () => loadReferenceSets());
+elements.referenceSetPause.addEventListener("click", pauseOrResumeReferenceSet);
+elements.referenceSetCancel.addEventListener("click", cancelReferenceSet);
+elements.oneModelReferenceSelect.addEventListener("change", () => {
+  setOneModelQuery("reference_set_id", elements.oneModelReferenceSelect.value);
+  renderReferenceSetLibrary();
+  updateOneModelTargetValidation();
+});
+elements.oneModelDefaultModel.addEventListener("input", updateOneModelTargetValidation);
+elements.oneModelMaxStations.addEventListener("input", updateOneModelTargetValidation);
+elements.oneModelPerStation.addEventListener("input", updateOneModelTargetValidation);
+elements.oneModelGlobalConcurrency.addEventListener("input", updateOneModelTargetValidation);
+elements.importOneModelTsv.addEventListener("click", importOneModelTsv);
+elements.addOneModelTarget.addEventListener("click", () => addOneModelTargetRow());
+elements.clearOneModelTargets.addEventListener("click", clearOneModelTargets);
+elements.runOneModelBatch.addEventListener("click", runOneModelBatch);
+elements.oneModelResultFilter.addEventListener("change", renderOneModelResults);
+elements.oneModelResultSort.addEventListener("change", renderOneModelResults);
+elements.oneModelPause.addEventListener("click", pauseOrResumeOneModelBatch);
+elements.oneModelCancel.addEventListener("click", cancelOneModelBatch);
 
 document.addEventListener("input", (event) => {
   if (event.target instanceof HTMLInputElement && event.target.classList.contains("api-key")) return;
@@ -2324,11 +3425,6 @@ document.addEventListener("change", (event) => {
 elements.resetWorkspace?.addEventListener("click", () => {
   const confirmed = window.confirm("重置当前工作区配置？历史对比记录和证据不会删除。");
   if (!confirmed) return;
-  try {
-    localStorage.removeItem(workspaceStorageKey);
-  } catch {
-    // 即使浏览器拒绝存储，也继续重置当前页面。
-  }
   document.querySelectorAll(".api-key").forEach((input) => {
     input.value = "";
   });
@@ -2361,3 +3457,4 @@ async function initializeConsole() {
 }
 
 initializeConsole();
+initializeOneModelWorkbench();

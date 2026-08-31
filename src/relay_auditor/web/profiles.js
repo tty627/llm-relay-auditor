@@ -5,6 +5,12 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, () => {
   const LEGACY_PROFILE_ID = "legacy-one-token/v1";
   const PAPER_PROFILE_ID = "bruckner-2026-canonical40/v1";
+  const ONE_MODEL_REFERENCE_REQUESTS = 3 * 40 * 30;
+  const ONE_MODEL_TARGET_REQUESTS = 40 * 30;
+  const protocolProfiles = Object.freeze({
+    openai_chat: "openai-chat-onetoken-v1",
+    anthropic_messages: "anthropic-messages-opus5-onetoken-v1",
+  });
 
   const profiles = Object.freeze({
     [LEGACY_PROFILE_ID]: Object.freeze({
@@ -116,6 +122,135 @@
     };
   }
 
+  function transportProfileForProtocol(protocol) {
+    return protocolProfiles[protocol] || protocolProfiles.anthropic_messages;
+  }
+
+  function normalizeOneModelBaseUrl(value) {
+    const raw = String(value || "").trim();
+    let parsed;
+    try {
+      parsed = new URL(raw);
+    } catch {
+      return { valid: false, value: "", error: "URL 格式无效" };
+    }
+    if (parsed.protocol !== "https:") {
+      return { valid: false, value: "", error: "必须使用 HTTPS" };
+    }
+    if (parsed.username || parsed.password) {
+      return { valid: false, value: "", error: "URL 不得包含用户信息" };
+    }
+    if (parsed.search || parsed.hash) {
+      return { valid: false, value: "", error: "URL 不得包含查询参数或片段" };
+    }
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    return {
+      valid: true,
+      value: `${parsed.origin}${pathname}`,
+      error: "",
+    };
+  }
+
+  function credentialSpec(value) {
+    const clean = String(value || "").trim();
+    if (!clean) return { valid: false, value: null, error: "凭据不能为空" };
+    if (clean.toLowerCase().startsWith("env:")) {
+      const name = clean.slice(4).trim();
+      if (!/^[A-Z_][A-Z0-9_]{0,99}$/.test(name)) {
+        return { valid: false, value: null, error: "env 名称格式无效" };
+      }
+      return { valid: true, value: { mode: "env_ref", name }, error: "" };
+    }
+    return {
+      valid: true,
+      value: { mode: "ephemeral", api_key: clean },
+      error: "",
+    };
+  }
+
+  function parseOneModelTsv(text) {
+    const sourceLines = String(text || "").split(/\r?\n/);
+    const rows = [];
+    const errors = [];
+    sourceLines.forEach((line, sourceIndex) => {
+      if (!line.trim()) return;
+      const columns = line.split("\t");
+      const header = columns.map((column) => column.trim().toLowerCase());
+      if (
+        rows.length === 0
+        && header[0] === "station_name"
+        && ["url", "base_url"].includes(header[1])
+      ) return;
+      if (columns.length < 3 || columns.length > 4) {
+        errors.push({ row: sourceIndex + 1, message: "需要 3 或 4 个 TSV 列" });
+        return;
+      }
+      rows.push({
+        sourceRow: sourceIndex + 1,
+        stationName: columns[0].trim(),
+        baseUrl: columns[1].trim(),
+        credentialText: columns[2].trim(),
+        modelId: (columns[3] || "").trim(),
+      });
+    });
+    if (rows.length > 20) errors.push({ row: 0, message: "单批最多 20 个中转站" });
+    return { rows: rows.slice(0, 20), errors };
+  }
+
+  function validateOneModelTargets(rows, defaultModelId) {
+    const fallbackModel = String(defaultModelId || "").trim();
+    const errors = [];
+    const seen = new Set();
+    const targets = [];
+    if (!fallbackModel) errors.push({ row: 0, message: "默认模型 ID 不能为空" });
+    if (!Array.isArray(rows) || rows.length < 1 || rows.length > 20) {
+      errors.push({ row: 0, message: "目标数量必须为 1–20" });
+      return { valid: false, targets, errors };
+    }
+    rows.forEach((row, index) => {
+      const rowNumber = Number(row?.sourceRow) || index + 1;
+      const stationName = String(row?.stationName || "").trim();
+      const modelId = String(row?.modelId || "").trim();
+      if (!stationName || stationName.length > 80) {
+        errors.push({ row: rowNumber, message: "站点名需要 1–80 个字符" });
+      }
+      if (modelId.length > 255) {
+        errors.push({ row: rowNumber, message: "模型别名不能超过 255 个字符" });
+      }
+      const normalizedUrl = normalizeOneModelBaseUrl(row?.baseUrl);
+      if (!normalizedUrl.valid) {
+        errors.push({ row: rowNumber, message: normalizedUrl.error });
+      }
+      const credential = credentialSpec(row?.credentialText);
+      if (!credential.valid) {
+        errors.push({ row: rowNumber, message: credential.error });
+      }
+      const effectiveModel = modelId || fallbackModel;
+      const identity = `${normalizedUrl.value.toLowerCase()}\u0000${effectiveModel}`;
+      if (normalizedUrl.valid && effectiveModel && seen.has(identity)) {
+        errors.push({ row: rowNumber, message: "URL 与实际模型组合重复" });
+      }
+      if (normalizedUrl.valid && effectiveModel) seen.add(identity);
+      targets.push({
+        row_id: `row-${String(index + 1).padStart(2, "0")}`,
+        station_name: stationName,
+        base_url: normalizedUrl.value,
+        credential: credential.value,
+        model_id: modelId || null,
+      });
+    });
+    return { valid: errors.length === 0, targets, errors };
+  }
+
+  function oneModelRequestEstimate(targetCount) {
+    const count = Math.max(0, Math.min(20, Number(targetCount) || 0));
+    return {
+      referenceRequests: ONE_MODEL_REFERENCE_REQUESTS,
+      targetRequests: count * ONE_MODEL_TARGET_REQUESTS,
+      totalRequests: ONE_MODEL_REFERENCE_REQUESTS + count * ONE_MODEL_TARGET_REQUESTS,
+    };
+  }
+
   return Object.freeze({
     LEGACY_PROFILE_ID,
     PAPER_PROFILE_ID,
@@ -127,5 +262,14 @@
     mappingProfileSummary,
     requestCount,
     referenceCollectionRequest,
+    protocolProfiles,
+    ONE_MODEL_REFERENCE_REQUESTS,
+    ONE_MODEL_TARGET_REQUESTS,
+    transportProfileForProtocol,
+    normalizeOneModelBaseUrl,
+    credentialSpec,
+    parseOneModelTsv,
+    validateOneModelTargets,
+    oneModelRequestEstimate,
   });
 });
