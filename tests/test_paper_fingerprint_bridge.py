@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 from pathlib import Path
@@ -5,7 +6,11 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from relay_auditor.detectors.fingerprint import FingerprintRunner
+from relay_auditor.detectors.fingerprint import (
+    FingerprintPausedError,
+    FingerprintRunner,
+    FingerprintStalledError,
+)
 from relay_auditor.schemas import (
     EndpointSpec,
     EphemeralConnectionSpec,
@@ -195,6 +200,80 @@ def write_paper_artifacts(
     }
 
 
+def write_partial_paper_artifacts(
+    output_path: Path,
+    samples_path: Path,
+    *,
+    completed: int = 2,
+    role: str = "audit",
+    scheduler_seed: str = "safe-seed",
+    model: str = "paper-model",
+) -> dict:
+    payload = write_paper_artifacts(
+        output_path,
+        samples_path,
+        role=role,
+        scheduler_seed=scheduler_seed,
+        model=model,
+    )
+    fingerprint = payload["fingerprint"]
+    evidence = [
+        json.loads(line)
+        for line in samples_path.read_text(encoding="utf-8").splitlines()[:completed]
+    ]
+    evidence_text = "".join(
+        f"{json.dumps(sample, sort_keys=True, separators=(',', ':'))}\n" for sample in evidence
+    )
+    samples_path.write_text(evidence_text, encoding="utf-8")
+    for cell in fingerprint["cells"].values():
+        cell.update(
+            counts={},
+            validCount=0,
+            invalidCount=0,
+            refusalCount=0,
+            emptyCount=0,
+            errorCount=0,
+            totalCount=0,
+            entropyBits=0,
+            normalizedEntropy=0,
+            medianLatencyMs=None,
+            meanCompletionTokens=None,
+            meanReasoningTokens=None,
+        )
+    for sample in evidence:
+        cell = fingerprint["cells"][sample["cellId"]]
+        cell["counts"] = {"7": 1}
+        cell["validCount"] = 1
+        cell["totalCount"] = 1
+        cell["medianLatencyMs"] = 1
+        cell["meanCompletionTokens"] = 1
+        cell["meanReasoningTokens"] = 0
+    fingerprint.update(
+        partial=True,
+        completedSamples=completed,
+        expectedSamples=40,
+        errorCount=0,
+        incompleteReason="sampling_in_progress",
+    )
+    fingerprint["quality"].update(
+        complete=False,
+        completedSamples=completed,
+        expectedSamples=40,
+        validSamples=completed,
+        invalidSamples=0,
+        refusalSamples=0,
+        emptySamples=0,
+        errorSamples=0,
+        directness="verified",
+        reasoningTraceCount=0,
+        reasoningTokenCount=0,
+        reasoningUsageObservedSamples=completed,
+        rawEvidenceSha256=hashlib.sha256(evidence_text.encode()).hexdigest(),
+    )
+    output_path.write_text(json.dumps(fingerprint), encoding="utf-8")
+    return fingerprint
+
+
 @pytest.mark.asyncio
 async def test_collect_paper_profile_keeps_key_out_of_argv_and_stdout(tmp_path, monkeypatch):
     cli_path = tmp_path / "cli.js"
@@ -231,6 +310,176 @@ async def test_collect_paper_profile_keeps_key_out_of_argv_and_stdout(tmp_path, 
     assert set(result) == {"fingerprint", "collection"}
     assert "samples" not in result
     assert "evidence" not in result
+
+
+@pytest.mark.asyncio
+async def test_collect_paper_profile_forwards_long_task_controls(tmp_path, monkeypatch):
+    cli_path = tmp_path / "cli.js"
+    cli_path.write_text("// fake", encoding="utf-8")
+    runner = FingerprintRunner(cli_path)
+    captured = {}
+    progress = []
+    cancel_event = asyncio.Event()
+
+    async def fake_execute_with_code(
+        arguments,
+        *,
+        accepted_exit_codes,
+        environment,
+        progress_callback,
+        cancel_event,
+        idle_timeout_seconds,
+    ):
+        captured.update(
+            arguments=arguments,
+            progress_callback=progress_callback,
+            cancel_event=cancel_event,
+            idle_timeout_seconds=idle_timeout_seconds,
+        )
+        actual_output = Path(arguments[arguments.index("--out") + 1])
+        actual_samples = Path(arguments[arguments.index("--samples-out") + 1])
+        payload = write_paper_artifacts(actual_output, actual_samples)
+        progress_callback(
+            {
+                "stage": "sampling",
+                "done": 1,
+                "total": 40,
+                "errors": 0,
+                "detail": None,
+                "lastErrorKind": None,
+                "lastHttpStatus": None,
+                "retrying": False,
+            }
+        )
+        return 0, payload
+
+    monkeypatch.setattr(runner, "_execute_with_code", fake_execute_with_code)
+    result = await runner.collect_paper_profile(
+        EndpointSpec(base_url="https://example.test/v1", model="paper-model"),
+        role="audit",
+        scheduler_seed="safe-seed",
+        output_path=tmp_path / "fingerprint.json",
+        samples_output_path=tmp_path / "samples.jsonl",
+        samples=1,
+        concurrency=2,
+        progress_callback=progress.append,
+        cancel_event=cancel_event,
+        idle_timeout_seconds=30,
+    )
+
+    assert result["fingerprint"]["formatVersion"] == 2
+    assert captured["progress_callback"] == progress.append
+    assert captured["cancel_event"] is cancel_event
+    assert captured["idle_timeout_seconds"] == 30
+    assert "--quiet" not in captured["arguments"]
+    assert progress[0]["done"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("interruption", "expected_error", "expected_reason"),
+    [
+        ("pause", FingerprintPausedError, "execution_interrupted"),
+        ("stall", FingerprintStalledError, "progress_timeout"),
+    ],
+)
+async def test_collect_paper_profile_preserves_valid_partial_pair(
+    tmp_path,
+    monkeypatch,
+    interruption,
+    expected_error,
+    expected_reason,
+):
+    cli_path = tmp_path / "cli.js"
+    cli_path.write_text("// fake", encoding="utf-8")
+    runner = FingerprintRunner(cli_path)
+    output_path = tmp_path / "fingerprint.json"
+    samples_path = tmp_path / "samples.jsonl"
+    output_path.write_text("old fingerprint", encoding="utf-8")
+    samples_path.write_text("old samples", encoding="utf-8")
+
+    async def fake_execute_with_code(arguments, **kwargs):
+        actual_output = Path(arguments[arguments.index("--out") + 1])
+        actual_samples = Path(arguments[arguments.index("--samples-out") + 1])
+        write_partial_paper_artifacts(actual_output, actual_samples, completed=2)
+        if interruption == "pause":
+            raise FingerprintPausedError("paused")
+        raise FingerprintStalledError(30)
+
+    monkeypatch.setattr(runner, "_execute_with_code", fake_execute_with_code)
+    call_options = (
+        {"cancel_event": asyncio.Event()}
+        if interruption == "pause"
+        else {"idle_timeout_seconds": 30}
+    )
+    with pytest.raises(expected_error) as caught:
+        await runner.collect_paper_profile(
+            EndpointSpec(base_url="https://example.test/v1", model="paper-model"),
+            role="audit",
+            scheduler_seed="safe-seed",
+            output_path=output_path,
+            samples_output_path=samples_path,
+            samples=1,
+            concurrency=2,
+            **call_options,
+        )
+
+    fingerprint = json.loads(output_path.read_text(encoding="utf-8"))
+    assert fingerprint["partial"] is True
+    assert fingerprint["completedSamples"] == 2
+    assert fingerprint["incompleteReason"] == expected_reason
+    assert len(samples_path.read_text(encoding="utf-8").splitlines()) == 2
+    assert caught.value.partial_artifact == {
+        "partial": True,
+        "completedSamples": 2,
+        "expectedSamples": 40,
+        "errorCount": 0,
+        "incompleteReason": expected_reason,
+        "model": "paper-model",
+    }
+    assert not list(tmp_path.glob(".*.tmp*"))
+
+
+@pytest.mark.asyncio
+async def test_collect_paper_profile_drops_partial_that_contains_key_material(
+    tmp_path,
+    monkeypatch,
+):
+    cli_path = tmp_path / "cli.js"
+    cli_path.write_text("// fake", encoding="utf-8")
+    runner = FingerprintRunner(cli_path)
+    output_path = tmp_path / "fingerprint.json"
+    samples_path = tmp_path / "samples.jsonl"
+    output_path.write_text("old fingerprint", encoding="utf-8")
+    samples_path.write_text("old samples", encoding="utf-8")
+    secret = "sk-partial-must-not-persist"
+
+    async def fake_execute_with_code(arguments, **kwargs):
+        actual_output = Path(arguments[arguments.index("--out") + 1])
+        actual_samples = Path(arguments[arguments.index("--samples-out") + 1])
+        fingerprint = write_partial_paper_artifacts(actual_output, actual_samples, completed=1)
+        fingerprint["meta"] = {"unsafe": secret}
+        actual_output.write_text(json.dumps(fingerprint), encoding="utf-8")
+        raise FingerprintPausedError("paused")
+
+    monkeypatch.setattr(runner, "_execute_with_code", fake_execute_with_code)
+    with pytest.raises(FingerprintPausedError) as caught:
+        await runner.collect_paper_profile(
+            EndpointSpec(base_url="https://example.test/v1", model="paper-model"),
+            role="audit",
+            scheduler_seed="safe-seed",
+            output_path=output_path,
+            samples_output_path=samples_path,
+            samples=1,
+            concurrency=2,
+            api_key=secret,
+            cancel_event=asyncio.Event(),
+        )
+
+    assert caught.value.partial_artifact is None
+    assert output_path.read_text(encoding="utf-8") == "old fingerprint"
+    assert samples_path.read_text(encoding="utf-8") == "old samples"
+    assert not list(tmp_path.glob(".*.tmp*"))
 
 
 @pytest.mark.asyncio

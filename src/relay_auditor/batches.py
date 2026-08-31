@@ -22,8 +22,11 @@ from relay_auditor.detectors.preflight import (
 )
 from relay_auditor.evidence import EvidenceStore
 from relay_auditor.schemas import (
+    LEGACY_ONE_TOKEN_PROFILE,
+    PAPER_ONE_TOKEN_PROFILE,
     ConsoleComparisonBatchItemRequest,
     ConsoleComparisonBatchRequest,
+    OneTokenMethodProfileId,
 )
 
 TERMINAL_RUN_STATUSES = {"completed", "failed", "canceled", "interrupted"}
@@ -51,6 +54,7 @@ class BatchRuntime:
     interrupt_event: asyncio.Event
     lock: asyncio.Lock
     station_order: list[str]
+    method_profile_id: OneTokenMethodProfileId
     station_cursor_by_priority: dict[int, int] = field(default_factory=dict)
     station_retry_at: dict[str, float] = field(default_factory=dict)
     worker: asyncio.Task[None] | None = None
@@ -94,10 +98,24 @@ class ComparisonBatchManager:
         self._runtimes: dict[str, BatchRuntime] = {}
 
     def start(self, request: ConsoleComparisonBatchRequest) -> str:
-        for artifact_id in dict.fromkeys(
-            item.reference_artifact_id for item in request.items
-        ):
+        method_profiles: set[OneTokenMethodProfileId] = set()
+        for artifact_id in dict.fromkeys(item.reference_artifact_id for item in request.items):
             self._verified_reference_path(artifact_id)
+            method_profiles.add(
+                self.evidence.fingerprint_method_profile(
+                    artifact_id,
+                    metadata=self.database.get_reference_metadata(artifact_id),
+                )
+            )
+        if len(method_profiles) != 1:
+            profiles = ", ".join(sorted(method_profiles))
+            raise ValueError("a comparison batch cannot mix One Token method profiles: " + profiles)
+        method_profile_id = next(iter(method_profiles))
+        if method_profile_id == LEGACY_ONE_TOKEN_PROFILE and request.cells > 16:
+            raise ValueError("legacy-one-token/v1 supports at most 16 cells")
+        if method_profile_id == PAPER_ONE_TOKEN_PROFILE and request.cells != 40:
+            raise ValueError("bruckner-2026-canonical40/v1 requires exactly 40 cells")
+        effective_cells = 40 if method_profile_id == PAPER_ONE_TOKEN_PROFILE else request.cells
 
         batch_id = str(uuid4())
         indexed_items = list(enumerate(request.items))
@@ -128,10 +146,13 @@ class ComparisonBatchManager:
                 )
             )
 
+        # Publish the in-memory runtime only after the complete durable queue
+        # has committed.  A database exception therefore cannot leave either
+        # a partial queued batch or a scheduler pointing at missing rows.
         self.database.create_comparison_batch_queue(
             batch_id=batch_id,
             items=database_items,
-            cells=request.cells,
+            cells=effective_cells,
             samples=request.samples,
             concurrency=request.concurrency,
             concurrency_mode=request.concurrency_mode,
@@ -143,6 +164,7 @@ class ComparisonBatchManager:
             interrupt_event=asyncio.Event(),
             lock=asyncio.Lock(),
             station_order=list(dict.fromkeys(item.station_name for item in request.items)),
+            method_profile_id=method_profile_id,
         )
         self._runtimes[batch_id] = runtime
         runtime.worker = asyncio.create_task(self._run(runtime))
@@ -163,9 +185,31 @@ class ComparisonBatchManager:
             )
         if not run.artifact_sha256:
             raise ValueError(f"reference artifact digest is missing: {artifact_id}")
-        if self.evidence.digest_file(expected_path) != run.artifact_sha256:
+        actual_sha256 = self.evidence.digest_file(expected_path)
+        if actual_sha256 != run.artifact_sha256:
             raise ValueError(f"reference artifact digest mismatch: {artifact_id}")
+        fingerprint = self.evidence.read_json(expected_path)
+        if fingerprint.get("formatVersion") == 2:
+            samples_path = self.evidence.fingerprint_samples_path(
+                artifact_id,
+                must_exist=True,
+            )
+            quality = fingerprint.get("quality")
+            raw_sha256 = quality.get("rawEvidenceSha256") if isinstance(quality, dict) else None
+            if (
+                not isinstance(raw_sha256, str)
+                or self.evidence.digest_file(samples_path) != raw_sha256
+            ):
+                raise ValueError(f"reference raw sample evidence digest mismatch: {artifact_id}")
         return expected_path
+
+    @staticmethod
+    def _cell_count(runtime: BatchRuntime) -> int:
+        return 40 if runtime.method_profile_id == PAPER_ONE_TOKEN_PROFILE else runtime.request.cells
+
+    @classmethod
+    def _total_requests(cls, runtime: BatchRuntime) -> int:
+        return cls._cell_count(runtime) * runtime.request.samples
 
     async def pause(self, batch_id: str) -> None:
         runtime = self._runtime_for_active_batch(batch_id)
@@ -603,10 +647,25 @@ class ComparisonBatchManager:
             except (OSError, ValueError):
                 bucket["failures"] += 1
                 continue
+            observed_profile = result.get("methodProfileId") or LEGACY_ONE_TOKEN_PROFILE
+            if observed_profile != runtime.method_profile_id:
+                bucket["attempts"] -= 1
+                if bucket["attempts"] == 0:
+                    stats.pop(selected, None)
+                continue
             target = result.get("target", {})
             total = max(1, batch.cells * batch.samples)
-            error_count = target.get("errorCount")
-            split_half = target.get("splitHalfJsd")
+            collection = target.get("collection") if isinstance(target, dict) else None
+            error_count = (
+                collection.get("errorSamples")
+                if isinstance(collection, dict)
+                else target.get("errorCount")
+            )
+            split_half = (
+                collection.get("splitHalfMeanJsd")
+                if isinstance(collection, dict)
+                else target.get("splitHalfJsd")
+            )
             duration = target.get("durationMs")
             if isinstance(error_count, int):
                 bucket["errorRates"].append(error_count / total)
@@ -918,7 +977,7 @@ class ComparisonBatchManager:
             item.audit_id,
             stage="waiting_retry",
             done=0,
-            total=runtime.request.cells * runtime.request.samples,
+            total=self._total_requests(runtime),
             errors=retry_number,
             detail=(
                 f"预检第 {retry_number} 次遇到可恢复错误：{error}；"
@@ -1033,7 +1092,7 @@ class ComparisonBatchManager:
             audit_id,
             stage="starting",
             done=0,
-            total=runtime.request.cells * runtime.request.samples,
+            total=self._total_requests(runtime),
             errors=0,
             detail=str(concurrency["reason"]),
         )
@@ -1093,7 +1152,7 @@ class ComparisonBatchManager:
                 audit_id,
                 stage="preflight",
                 done=0,
-                total=runtime.request.cells * runtime.request.samples,
+                total=self._total_requests(runtime),
                 errors=0,
                 detail=(
                     f"正在进行第 {item.preflight_attempts} 次兼容性预检"
@@ -1112,7 +1171,7 @@ class ComparisonBatchManager:
                     ) from error
                 raise
             latency_seconds = max(0.0, float(preflight.get("latencyMs") or 0) / 1000)
-            total_requests = runtime.request.cells * runtime.request.samples
+            total_requests = self._total_requests(runtime)
             waves = math.ceil(total_requests / selected_concurrency)
             minimum_seconds = latency_seconds * waves
             estimated_seconds = latency_seconds * (waves + 4) * 1.25
@@ -1135,19 +1194,64 @@ class ComparisonBatchManager:
                 ),
             )
             try:
-                verdict, result = await self.fingerprint.verify(
-                    endpoint,
-                    reference_path=reference_path,
-                    output_path=target_path,
-                    cells=runtime.request.cells,
-                    samples=runtime.request.samples,
-                    concurrency=selected_concurrency,
-                    api_key=api_key,
-                    progress_callback=on_progress,
-                    cancel_event=runtime.interrupt_event,
-                    request_timeout_ms=round(runtime.request.request_timeout_seconds * 1000),
-                    idle_timeout_seconds=runtime.request.model_timeout_seconds,
-                )
+                if runtime.method_profile_id == PAPER_ONE_TOKEN_PROFILE:
+                    collected = await self.fingerprint.collect_paper_profile(
+                        endpoint,
+                        role="audit",
+                        scheduler_seed=f"relay-auditor:audit:{audit_id}",
+                        output_path=target_path,
+                        samples_output_path=self.evidence.fingerprint_samples_path(audit_id),
+                        samples=runtime.request.samples,
+                        concurrency=selected_concurrency,
+                        timeout=round(runtime.request.request_timeout_seconds * 1000),
+                        api_key=api_key,
+                        progress_callback=on_progress,
+                        cancel_event=runtime.interrupt_event,
+                        idle_timeout_seconds=runtime.request.model_timeout_seconds,
+                    )
+                    if runtime.interrupt_event.is_set():
+                        raise FingerprintPausedError(
+                            "comparison interrupted before paper-profile comparison"
+                        )
+                    comparison = await self.fingerprint.compare_paper_fingerprints(
+                        enrollment_path=reference_path,
+                        audit_path=target_path,
+                    )
+                    verdict = str(comparison.get("verdict") or "insufficient")
+                    result = {
+                        "verdict": verdict,
+                        "meanJsd": comparison.get("meanJsd"),
+                        "comparison": comparison,
+                        "target": {
+                            "fingerprint": collected["fingerprint"],
+                            "collection": collected["collection"],
+                        },
+                        "reference": self.evidence.read_json(reference_path),
+                        "methodProfileId": runtime.method_profile_id,
+                        "interpretation": "uncalibrated-non-decision-evidence",
+                        "decisionEligible": False,
+                        "targetSamplesArtifactId": audit_id,
+                        "targetRawEvidenceSha256": collected["collection"].get("rawEvidenceSha256"),
+                        "warnings": [
+                            "Paper-profile distance is exploratory until a validated local "
+                            "threshold policy is supplied."
+                        ],
+                    }
+                else:
+                    verdict, result = await self.fingerprint.verify(
+                        endpoint,
+                        reference_path=reference_path,
+                        output_path=target_path,
+                        cells=runtime.request.cells,
+                        samples=runtime.request.samples,
+                        concurrency=selected_concurrency,
+                        api_key=api_key,
+                        progress_callback=on_progress,
+                        cancel_event=runtime.interrupt_event,
+                        request_timeout_ms=round(runtime.request.request_timeout_seconds * 1000),
+                        idle_timeout_seconds=runtime.request.model_timeout_seconds,
+                    )
+                    result = {**result, "methodProfileId": runtime.method_profile_id}
             except FingerprintStalledError as error:
                 raise RuntimeError(
                     f"连续 {error.idle_timeout_seconds:g} 秒没有收到任何采样或重试进度，"
@@ -1162,6 +1266,7 @@ class ComparisonBatchManager:
                 **result,
                 "reference_artifact_id": request.reference_artifact_id,
                 "execution": {
+                    "methodProfileId": runtime.method_profile_id,
                     "priority": item.priority,
                     "concurrency": concurrency,
                     "preflight": preflight,

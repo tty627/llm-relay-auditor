@@ -298,6 +298,10 @@ class FingerprintRunner:
         samples: int,
         concurrency: int,
         api_key: str | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        cancel_event: asyncio.Event | None = None,
+        request_timeout_ms: int | None = None,
+        idle_timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         arguments, environment, credential = self._base_arguments(
             endpoint,
@@ -307,15 +311,57 @@ class FingerprintRunner:
             subcommand="fingerprint",
             api_key=api_key,
         )
-        arguments.extend(["--out", str(output_path), "--json", "--quiet"])
+        if request_timeout_ms is not None:
+            arguments.extend(["--timeout", str(request_timeout_ms)])
+        arguments.extend(["--out", str(output_path), "--json"])
+        if progress_callback is None and idle_timeout_seconds is None:
+            arguments.append("--quiet")
         try:
-            payload = await self._execute(
-                arguments,
-                accepted_exit_codes={0},
-                environment=environment,
+            if progress_callback is None and cancel_event is None and idle_timeout_seconds is None:
+                payload = await self._execute(
+                    arguments,
+                    accepted_exit_codes={0},
+                    environment=environment,
+                )
+            else:
+                _, payload = await self._execute_with_code(
+                    arguments,
+                    accepted_exit_codes={0},
+                    environment=environment,
+                    progress_callback=progress_callback,
+                    cancel_event=cancel_event,
+                    idle_timeout_seconds=idle_timeout_seconds,
+                )
+        except FingerprintPausedError as error:
+            error.partial_artifact = self.mark_partial_artifact(
+                output_path,
+                incomplete_reason="execution_interrupted",
             )
+            if self._discard_credential_echo(
+                output_path,
+                payload=error.partial_artifact,
+                credential=credential,
+            ):
+                raise RuntimeError(_CREDENTIAL_ECHO_ERROR) from error
+            raise
         except asyncio.CancelledError:
+            self.mark_partial_artifact(
+                output_path,
+                incomplete_reason="execution_interrupted",
+            )
             self._discard_credential_echo(output_path, credential=credential)
+            raise
+        except FingerprintStalledError as error:
+            error.partial_artifact = self.mark_partial_artifact(
+                output_path,
+                incomplete_reason="progress_timeout",
+            )
+            if self._discard_credential_echo(
+                output_path,
+                payload=error.partial_artifact,
+                credential=credential,
+            ):
+                raise RuntimeError(_CREDENTIAL_ECHO_ERROR) from error
             raise
         except Exception as error:
             if self._discard_credential_echo(output_path, credential=credential):
@@ -341,6 +387,9 @@ class FingerprintRunner:
         concurrency: int,
         timeout: int = 90_000,
         api_key: str | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        cancel_event: asyncio.Event | None = None,
+        idle_timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         """Explicitly collect the pinned paper profile and verify its evidence contract.
 
@@ -407,17 +456,28 @@ class FingerprintRunner:
             "--samples-out",
             str(temporary_samples_path),
             "--json",
-            "--quiet",
         ]
+        if progress_callback is None and idle_timeout_seconds is None:
+            arguments.append("--quiet")
         if credential and any(credential in argument for argument in arguments):
             raise RuntimeError("paper-fingerprint API key must not appear in process arguments")
 
         try:
-            payload = await self._execute(
-                arguments,
-                accepted_exit_codes={0},
-                environment=environment,
-            )
+            if progress_callback is None and cancel_event is None and idle_timeout_seconds is None:
+                payload = await self._execute(
+                    arguments,
+                    accepted_exit_codes={0},
+                    environment=environment,
+                )
+            else:
+                _, payload = await self._execute_with_code(
+                    arguments,
+                    accepted_exit_codes={0},
+                    environment=environment,
+                    progress_callback=progress_callback,
+                    cancel_event=cancel_event,
+                    idle_timeout_seconds=idle_timeout_seconds,
+                )
             validated = self._validate_paper_collection(
                 payload,
                 output_path=temporary_fingerprint_path,
@@ -435,6 +495,48 @@ class FingerprintRunner:
                 samples_path=samples_path,
             )
             return validated
+        except FingerprintPausedError as error:
+            error.partial_artifact = self._preserve_paper_partial_collection(
+                temporary_fingerprint_path=temporary_fingerprint_path,
+                temporary_samples_path=temporary_samples_path,
+                fingerprint_path=fingerprint_path,
+                samples_path=samples_path,
+                endpoint=endpoint,
+                role=role,
+                scheduler_seed=scheduler_seed,
+                samples=samples,
+                credential=credential,
+                incomplete_reason="execution_interrupted",
+            )
+            raise
+        except FingerprintStalledError as error:
+            error.partial_artifact = self._preserve_paper_partial_collection(
+                temporary_fingerprint_path=temporary_fingerprint_path,
+                temporary_samples_path=temporary_samples_path,
+                fingerprint_path=fingerprint_path,
+                samples_path=samples_path,
+                endpoint=endpoint,
+                role=role,
+                scheduler_seed=scheduler_seed,
+                samples=samples,
+                credential=credential,
+                incomplete_reason="progress_timeout",
+            )
+            raise
+        except asyncio.CancelledError:
+            self._preserve_paper_partial_collection(
+                temporary_fingerprint_path=temporary_fingerprint_path,
+                temporary_samples_path=temporary_samples_path,
+                fingerprint_path=fingerprint_path,
+                samples_path=samples_path,
+                endpoint=endpoint,
+                role=role,
+                scheduler_seed=scheduler_seed,
+                samples=samples,
+                credential=credential,
+                incomplete_reason="execution_interrupted",
+            )
+            raise
         finally:
             temporary_fingerprint_path.unlink(missing_ok=True)
             temporary_samples_path.unlink(missing_ok=True)
@@ -494,6 +596,133 @@ class FingerprintRunner:
         else:
             fingerprint_backup.unlink(missing_ok=True)
             samples_backup.unlink(missing_ok=True)
+
+    @classmethod
+    def _preserve_paper_partial_collection(
+        cls,
+        *,
+        temporary_fingerprint_path: Path,
+        temporary_samples_path: Path,
+        fingerprint_path: Path,
+        samples_path: Path,
+        endpoint: EndpointSpec,
+        role: str,
+        scheduler_seed: str,
+        samples: int,
+        credential: str | None,
+        incomplete_reason: str,
+    ) -> dict[str, Any] | None:
+        """Validate and promote a credential-free V2 checkpoint after interruption."""
+
+        try:
+            fingerprint_bytes = temporary_fingerprint_path.read_bytes()
+            evidence_bytes = temporary_samples_path.read_bytes()
+            if credential:
+                secret = credential.encode()
+                if secret in fingerprint_bytes or secret in evidence_bytes:
+                    return None
+
+            fingerprint = cls._load_fingerprint(
+                temporary_fingerprint_path,
+                label="partial paper fingerprint artifact",
+            )
+            if fingerprint.get("formatVersion") != 2 or fingerprint.get("partial") is not True:
+                return None
+            plan = fingerprint["plan"]
+            quality = fingerprint["quality"]
+            expected_samples = _PAPER_CELL_COUNT * samples
+            if (
+                fingerprint.get("protocol") != _PAPER_PROTOCOL
+                or fingerprint.get("model") != endpoint.model
+                or fingerprint.get("manifest") != _PAPER_MANIFEST
+                or fingerprint.get("postReasoning") is not False
+                or tuple(plan.get("cellIds", ())) != _PAPER_ORDERED_CELL_IDS
+                or plan.get("role") != role
+                or plan.get("schedulerSeed") != scheduler_seed
+                or plan.get("schedulerPolicy") != _PAPER_SCHEDULER_POLICY
+                or fingerprint.get("samplesPerCell") != samples
+                or plan.get("samplesPerCell") != samples
+                or plan.get("expectedSamples") != expected_samples
+                or quality.get("expectedSamples") != expected_samples
+                or quality.get("complete") is not False
+            ):
+                return None
+            completed = quality.get("completedSamples")
+            if (
+                not _is_non_negative_integer(completed)
+                or completed == 0
+                or completed >= expected_samples
+            ):
+                return None
+            raw_evidence_sha = hashlib.sha256(evidence_bytes).hexdigest()
+            if quality.get("rawEvidenceSha256") != raw_evidence_sha:
+                return None
+
+            evidence_summary = cls._validate_paper_evidence_jsonl(
+                evidence_bytes,
+                protocol=_PAPER_PROTOCOL,
+                model=endpoint.model,
+                role=role,
+                scheduler_seed=scheduler_seed,
+                samples=samples,
+                cell_ids=set(_PAPER_ORDERED_CELL_IDS),
+                expected_completed=completed,
+            )
+            for category in ("valid", "invalid", "refusal", "empty", "error"):
+                if evidence_summary[category] != quality.get(f"{category}Samples"):
+                    return None
+            if evidence_summary["reasoningTrace"] != quality.get("reasoningTraceCount"):
+                return None
+            if evidence_summary["reasoningTokens"] != quality.get("reasoningTokenCount"):
+                return None
+            if evidence_summary["reasoningUsageObserved"] != quality.get(
+                "reasoningUsageObservedSamples"
+            ):
+                return None
+            contaminated = (
+                evidence_summary["reasoningTrace"] > 0 or evidence_summary["reasoningTokens"] > 0
+            )
+            expected_directness = (
+                "violated"
+                if contaminated
+                else "unknown"
+                if (
+                    evidence_summary["error"] > 0
+                    or evidence_summary["reasoningUsageObserved"]
+                    != evidence_summary["observableResponse"]
+                )
+                else "verified"
+            )
+            if quality.get("directness") != expected_directness:
+                return None
+            evidence_cells = evidence_summary["cells"]
+            for cell_id in _PAPER_ORDERED_CELL_IDS:
+                fingerprint_cell = fingerprint["cells"][cell_id]
+                evidence_cell = evidence_cells[cell_id]
+                for category in ("valid", "invalid", "refusal", "empty", "error"):
+                    if fingerprint_cell[f"{category}Count"] != evidence_cell[category]:
+                        return None
+                if (
+                    fingerprint_cell["totalCount"] != evidence_cell["total"]
+                    or fingerprint_cell["counts"] != evidence_cell["counts"]
+                ):
+                    return None
+
+            marked = cls.mark_partial_artifact(
+                temporary_fingerprint_path,
+                incomplete_reason=incomplete_reason,
+            )
+            if marked is None or marked["incompleteReason"] != incomplete_reason:
+                return None
+            cls._commit_paper_artifact_pair(
+                temporary_fingerprint_path=temporary_fingerprint_path,
+                temporary_samples_path=temporary_samples_path,
+                fingerprint_path=fingerprint_path,
+                samples_path=samples_path,
+            )
+            return cls.partial_artifact_summary(fingerprint_path)
+        except (OSError, RuntimeError, KeyError, TypeError, json.JSONDecodeError):
+            return None
 
     async def verify(
         self,
@@ -1350,15 +1579,18 @@ class FingerprintRunner:
         scheduler_seed: str,
         samples: int,
         cell_ids: set[str],
+        expected_completed: int | None = None,
     ) -> dict[str, Any]:
         try:
             text = content.decode("utf-8")
         except UnicodeDecodeError as error:
             raise RuntimeError("paper-fingerprint sample evidence is not UTF-8 JSONL") from error
-        if not text or not text.endswith("\n"):
+        if text and not text.endswith("\n"):
             raise RuntimeError("paper-fingerprint sample evidence must end with a newline")
         lines = text.splitlines()
-        expected_count = len(cell_ids) * samples
+        expected_count = (
+            len(cell_ids) * samples if expected_completed is None else expected_completed
+        )
         if len(lines) != expected_count:
             raise RuntimeError("paper-fingerprint JSONL sample count does not match the plan")
         summary: dict[str, Any] = {
@@ -1691,11 +1923,13 @@ class FingerprintRunner:
                 summary["observableResponse"] += 1
                 if isinstance(usage, dict) and usage.get("reasoningTokens") is not None:
                     summary["reasoningUsageObserved"] += 1
-        expected_jobs = {
+        planned_jobs = {
             (cell_id, repetition) for cell_id in cell_ids for repetition in range(samples)
         }
-        if observed != expected_jobs:
+        if expected_completed is None and observed != planned_jobs:
             raise RuntimeError("paper-fingerprint sample evidence does not cover the full plan")
+        if expected_completed is not None and not observed.issubset(planned_jobs):
+            raise RuntimeError("paper-fingerprint partial evidence contains an unplanned job")
         if evidence_order != sorted(evidence_order):
             raise RuntimeError("paper-fingerprint sample evidence is not in canonical job order")
         return summary
@@ -1973,12 +2207,14 @@ class FingerprintRunner:
                     timeout=idle_timeout_seconds,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
+                # A result that became ready in the same loop as a user cancel
+                # is complete evidence and should win the race.
+                if process_task in done:
+                    break
                 if cancel_task is not None and cancel_task in done and cancel_event.is_set():
                     await self._stop_process(process)
                     await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
-                    raise FingerprintPausedError("comparison paused by user")
-                if process_task in done:
-                    break
+                    raise FingerprintPausedError("fingerprint task paused by user")
                 if progress_task is not None and progress_task in done:
                     progress_event.clear()
                     progress_task = asyncio.create_task(progress_event.wait())

@@ -53,10 +53,7 @@ def main() -> None:
         },
     )
     for item in imported:
-        print(
-            f"{item.source_label}\t{item.model}\t{item.status}\t"
-            f"artifact={item.artifact_id}"
-        )
+        print(f"{item.source_label}\t{item.model}\t{item.status}\tartifact={item.artifact_id}")
     print(f"Imported {len(imported)} reference fingerprints.")
 
 

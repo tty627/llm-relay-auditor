@@ -5,6 +5,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from relay_auditor.schemas import (
+    LEGACY_ONE_TOKEN_PROFILE,
+    PAPER_ONE_TOKEN_PROFILE,
+    OneTokenMethodProfileId,
+)
+
 _EVIDENCE_EXTENSIONS = {
     "smoke": ".json",
     "fingerprints": ".json",
@@ -150,6 +156,41 @@ class EvidenceStore:
             expected_path=expected_path,
         )
         return artifact_path
+
+    def fingerprint_method_profile(
+        self,
+        artifact_id: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> OneTokenMethodProfileId:
+        """Resolve a reference profile from evidence, with legacy-history fallback.
+
+        Baseline metadata is useful for presentation but cannot override the
+        immutable fingerprint artifact. Old baselines predate method_profile_id,
+        so any non-V2 historical fingerprint remains legacy-compatible.
+        """
+
+        fingerprint = self.read_json(self.fingerprint_path(artifact_id, must_exist=True))
+        protocol = fingerprint.get("protocol")
+        format_version = fingerprint.get("formatVersion")
+        if format_version == 2 or protocol == PAPER_ONE_TOKEN_PROFILE:
+            if format_version != 2 or protocol != PAPER_ONE_TOKEN_PROFILE:
+                raise ValueError(
+                    "paper fingerprint evidence has an inconsistent formatVersion/protocol"
+                )
+            detected: OneTokenMethodProfileId = PAPER_ONE_TOKEN_PROFILE
+        else:
+            detected = LEGACY_ONE_TOKEN_PROFILE
+
+        declared = (metadata or {}).get("method_profile_id")
+        if declared is not None and declared not in {
+            LEGACY_ONE_TOKEN_PROFILE,
+            PAPER_ONE_TOKEN_PROFILE,
+        }:
+            raise ValueError(f"unsupported reference method_profile_id: {declared}")
+        if declared is not None and declared != detected:
+            raise ValueError("reference method_profile_id does not match its fingerprint evidence")
+        return detected
 
     @staticmethod
     def digest_file(path: Path) -> str:

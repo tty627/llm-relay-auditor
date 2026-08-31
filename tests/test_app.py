@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import threading
 import time
@@ -35,6 +36,8 @@ def _install_fast_batch_preflight(app, *, latency_ms: float = 1) -> None:
 
 
 def _register_reference(app, artifact_id: str, payload: dict[str, object]) -> Path:
+    """Write test evidence with the same persisted provenance required in production."""
+
     path = app.state.evidence.fingerprint_path(artifact_id)
     path.write_text(json.dumps(payload), encoding="utf-8")
     if app.state.database.get_run(artifact_id) is None:
@@ -52,6 +55,55 @@ def _register_reference(app, artifact_id: str, payload: dict[str, object]) -> Pa
         artifact_sha256=app.state.evidence.digest_file(path),
     )
     return path
+
+
+def _write_test_paper_collection(
+    output_path: Path,
+    samples_output_path: Path,
+    *,
+    model: str,
+    role: str,
+    samples: int,
+) -> dict[str, object]:
+    raw_evidence = f'{{"model":"{model}","role":"{role}"}}\n'
+    samples_output_path.write_text(raw_evidence, encoding="utf-8")
+    raw_sha256 = hashlib.sha256(raw_evidence.encode()).hexdigest()
+    fingerprint = {
+        "formatVersion": 2,
+        "protocol": "bruckner-2026-canonical40/v1",
+        "model": model,
+        "samplesPerCell": samples,
+        "postReasoning": False,
+        "cells": {},
+        "plan": {"role": role},
+        "quality": {
+            "complete": True,
+            "reasoningTokenCount": 0,
+            "rawEvidenceSha256": raw_sha256,
+        },
+    }
+    output_path.write_text(json.dumps(fingerprint), encoding="utf-8")
+    return {
+        "fingerprint": fingerprint,
+        "collection": {
+            "artifactKind": "paper-profile-collection-v2",
+            "interpretation": "uncalibrated-non-decision-evidence",
+            "decisionEligible": False,
+            "protocol": "bruckner-2026-canonical40/v1",
+            "model": model,
+            "role": role,
+            "cellCount": 40,
+            "samplesPerCell": samples,
+            "expectedSamples": 40 * samples,
+            "validSamples": 40 * samples,
+            "invalidSamples": 0,
+            "errorSamples": 0,
+            "directness": "verified",
+            "splitHalfMeanJsd": 0.01,
+            "splitHalfComparableCells": 40,
+            "rawEvidenceSha256": raw_sha256,
+        },
+    }
 
 
 def test_health_and_mock(tmp_path: Path) -> None:
@@ -223,11 +275,11 @@ def test_browser_console_is_served_with_security_headers(tmp_path: Path) -> None
 
         script = client.get("/assets/app.js")
         assert script.status_code == 200
-        assert "/api/v1/console/references/collect" in script.text
+        assert "/api/v1/console/reference-collections" in script.text
         assert "/api/v1/console/references/${reference.baselineId}" in script.text
         assert "/api/v1/console/models" in script.text
-        assert "预计还需" in script.text
-        assert "暂不可估（当前任务已超出初始估算）" in script.text
+        assert "创建后刷新页面也会继续执行" in script.text
+        assert "刷新页面会自动恢复此任务" in script.text
         assert "/api/v1/console/comparison-batches" in script.text
         assert "pauseOrResumeActiveBatch" in script.text
         assert "cancelActiveBatch" in script.text
@@ -235,7 +287,8 @@ def test_browser_console_is_served_with_security_headers(tmp_path: Path) -> None
         assert "concurrency_mode" in script.text
         assert "候选排名表示与本地参考指纹的距离" in script.text
         assert "秒没有收到新进度" in script.text
-        assert "第 ${index + 1}/${models.length} 个" in script.text
+        assert "pauseOrResumeReferenceCollection" in script.text
+        assert "cancelReferenceCollection" in script.text
         assert "relay-auditor.workspace.v1" in script.text
         assert "/api/v1/console/comparisons/latest" in script.text
         assert "request_timeout_seconds" in script.text
@@ -260,6 +313,7 @@ def test_console_direct_verify_rejects_client_comparison_context(tmp_path: Path)
     )
     app = create_app(settings)
     with TestClient(app) as client:
+        _register_reference(app, reference_id, target_fingerprint)
         response = client.post(
             "/api/v1/console/fingerprints/verify",
             json={
@@ -753,6 +807,310 @@ def test_console_reference_is_persisted_and_downloadable(tmp_path: Path, monkeyp
     assert all(
         secret not in path.read_text(encoding="utf-8") for path in evidence_dir.rglob("*.json")
     )
+
+
+def test_paper_reference_drives_v2_batch_and_keeps_result_exploratory(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    roles: list[str] = []
+
+    async def fake_collect_paper(
+        self,
+        endpoint,
+        *,
+        role,
+        output_path,
+        samples_output_path,
+        samples,
+        **kwargs,
+    ):
+        roles.append(role)
+        return _write_test_paper_collection(
+            output_path,
+            samples_output_path,
+            model=endpoint.model,
+            role=role,
+            samples=samples,
+        )
+
+    async def fake_compare_paper(self, *, enrollment_path, audit_path):
+        assert json.loads(enrollment_path.read_text())["plan"]["role"] == "enrollment"
+        assert json.loads(audit_path.read_text())["plan"]["role"] == "audit"
+        return {
+            "verdict": "match",
+            "meanJsd": 0.05,
+            "protocolMismatch": False,
+            "comparableCellCount": 40,
+            "cells": [],
+            "interpretation": "uncalibrated-non-decision-evidence",
+            "decisionEligible": False,
+        }
+
+    monkeypatch.setattr(FingerprintRunner, "collect_paper_profile", fake_collect_paper)
+    monkeypatch.setattr(FingerprintRunner, "compare_paper_fingerprints", fake_compare_paper)
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        evidence_dir=tmp_path / "evidence",
+        fingerprint_cli_path=Path("llm-fingerprint-detector/dist/cli.js"),
+    )
+    app = create_app(settings)
+    with TestClient(app) as client:
+        invalid_legacy = client.post(
+            "/api/v1/console/references/collect",
+            json={
+                "reference_name": "Invalid legacy reference",
+                "endpoint": {
+                    "base_url": "https://official.example/v1",
+                    "model": "model-a",
+                },
+                "cells": 40,
+                "samples": 10,
+                "concurrency": 2,
+            },
+        )
+        assert invalid_legacy.status_code == 422
+
+        reference = client.post(
+            "/api/v1/console/references/collect",
+            json={
+                "reference_name": "Paper reference",
+                "provider": "user_reference",
+                "method_profile_id": "bruckner-2026-canonical40/v1",
+                "endpoint": {
+                    "base_url": "https://official.example/v1",
+                    "model": "model-a",
+                },
+                "cells": 40,
+                "samples": 10,
+                "concurrency": 2,
+            },
+        )
+        assert reference.status_code == 200
+        saved = reference.json()["saved_reference"]
+        artifact_id = saved["artifact_id"]
+        assert saved["method_profile_id"] == "bruckner-2026-canonical40/v1"
+        assert saved["samples_evidence_available"] is True
+        catalog_item = client.get("/api/v1/console/references").json()["items"][0]
+        assert catalog_item["method_profile_id"] == "bruckner-2026-canonical40/v1"
+        assert catalog_item["baseline"]["metadata"]["cells"] == 40
+        assert catalog_item["samples_evidence_available"] is True
+
+        samples_download = client.get(f"/api/v1/console/evidence/{artifact_id}/samples")
+        assert samples_download.status_code == 200
+        assert samples_download.headers["content-type"].startswith("application/x-ndjson")
+        assert samples_download.headers["x-evidence-sha256"] == saved["raw_evidence_sha256"]
+
+        _install_fast_batch_preflight(app)
+        batch_payload = _comparison_batch_payload(
+            artifact_id,
+            ("model-a",),
+            concurrency=2,
+        )
+        batch_payload.update({"cells": 40, "samples": 10})
+        batch_response = client.post(
+            "/api/v1/console/comparison-batches",
+            json=batch_payload,
+        )
+        assert batch_response.status_code == 202
+        completed = _wait_for_comparison_batch(
+            client,
+            batch_response.json()["batch"]["id"],
+        )
+        assert completed["batch"]["cells"] == 40
+        item = completed["items"][0]
+        assert item["method_profile_id"] == "bruckner-2026-canonical40/v1"
+        assert item["verdict"] == "unverifiable"
+        assert item["response"]["result"]["decision"]["decisionEligible"] is False
+        assert item["response"]["result"]["interpretation"] == (
+            "uncalibrated-non-decision-evidence"
+        )
+        target_samples = client.get(f"/api/v1/console/evidence/{item['audit_id']}/samples")
+        assert target_samples.status_code == 200
+        assert item["samples_evidence_available"] is True
+        assert item["raw_evidence_sha256"] == target_samples.headers["x-evidence-sha256"]
+
+    assert roles == ["enrollment", "audit"]
+
+
+def test_comparison_batch_rejects_mixed_legacy_and_paper_references(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    async def fake_collect_paper(
+        self,
+        endpoint,
+        *,
+        role,
+        output_path,
+        samples_output_path,
+        samples,
+        **kwargs,
+    ):
+        return _write_test_paper_collection(
+            output_path,
+            samples_output_path,
+            model=endpoint.model,
+            role=role,
+            samples=samples,
+        )
+
+    monkeypatch.setattr(FingerprintRunner, "collect_paper_profile", fake_collect_paper)
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        evidence_dir=tmp_path / "evidence",
+        fingerprint_cli_path=Path("llm-fingerprint-detector/dist/cli.js"),
+    )
+    app = create_app(settings)
+    with TestClient(app) as client:
+        paper = client.post(
+            "/api/v1/console/references/collect",
+            json={
+                "reference_name": "Paper reference",
+                "method_profile_id": "bruckner-2026-canonical40/v1",
+                "endpoint": {
+                    "base_url": "https://official.example/v1",
+                    "model": "model-a",
+                },
+                "cells": 40,
+                "samples": 10,
+                "concurrency": 2,
+            },
+        ).json()["artifact_id"]
+        legacy = "00000000-0000-0000-0000-000000000079"
+        _register_reference(
+            app,
+            legacy,
+            {
+                "formatVersion": 1,
+                "protocol": "one-token/v1",
+                "model": "model-a",
+                "cells": {},
+            },
+        )
+        legacy_oversized = _comparison_batch_payload(legacy, ("legacy-target",))
+        legacy_oversized["cells"] = 40
+        legacy_response = client.post(
+            "/api/v1/console/comparison-batches",
+            json=legacy_oversized,
+        )
+        assert legacy_response.status_code == 409
+        assert "supports at most 16 cells" in legacy_response.json()["detail"]
+
+        payload = _comparison_batch_payload(paper, ("paper-target",))
+        legacy_item = _comparison_batch_payload(legacy, ("legacy-target",))["items"][0]
+        payload["items"].append(legacy_item)
+        response = client.post("/api/v1/console/comparison-batches", json=payload)
+        assert response.status_code == 409
+        assert "cannot mix One Token method profiles" in response.json()["detail"]
+
+
+def test_paper_batch_pause_interrupts_and_resume_restarts_current_audit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    audit_attempts = 0
+
+    async def fake_collect_paper(
+        self,
+        endpoint,
+        *,
+        role,
+        output_path,
+        samples_output_path,
+        samples,
+        progress_callback=None,
+        cancel_event=None,
+        idle_timeout_seconds=None,
+        **kwargs,
+    ):
+        nonlocal audit_attempts
+        if role == "audit":
+            audit_attempts += 1
+            assert callable(progress_callback)
+            assert cancel_event is not None
+            assert idle_timeout_seconds == 30
+            if audit_attempts == 1:
+                progress_callback(
+                    {
+                        "stage": "sampling",
+                        "done": 1,
+                        "total": 400,
+                        "errors": 0,
+                        "detail": "paper sample 1/400",
+                    }
+                )
+                await cancel_event.wait()
+                raise FingerprintPausedError("paper batch paused")
+        return _write_test_paper_collection(
+            output_path,
+            samples_output_path,
+            model=endpoint.model,
+            role=role,
+            samples=samples,
+        )
+
+    async def fake_compare_paper(self, *, enrollment_path, audit_path):
+        return {
+            "verdict": "match",
+            "meanJsd": 0.05,
+            "protocolMismatch": False,
+            "comparableCellCount": 40,
+            "cells": [],
+        }
+
+    monkeypatch.setattr(FingerprintRunner, "collect_paper_profile", fake_collect_paper)
+    monkeypatch.setattr(FingerprintRunner, "compare_paper_fingerprints", fake_compare_paper)
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        evidence_dir=tmp_path / "evidence",
+        fingerprint_cli_path=Path("llm-fingerprint-detector/dist/cli.js"),
+    )
+    app = create_app(settings)
+    _install_fast_batch_preflight(app)
+    with TestClient(app) as client:
+        reference_id = client.post(
+            "/api/v1/console/references/collect",
+            json={
+                "reference_name": "Paper reference",
+                "method_profile_id": "bruckner-2026-canonical40/v1",
+                "endpoint": {
+                    "base_url": "https://official.example/v1",
+                    "model": "model-a",
+                },
+                "cells": 40,
+                "samples": 10,
+                "concurrency": 2,
+            },
+        ).json()["artifact_id"]
+        payload = _comparison_batch_payload(reference_id, ("model-a",), concurrency=2)
+        payload.update({"cells": 40, "samples": 10})
+        started = client.post("/api/v1/console/comparison-batches", json=payload)
+        assert started.status_code == 202
+        batch_id = started.json()["batch"]["id"]
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            current = client.get(f"/api/v1/console/comparison-batches/{batch_id}").json()
+            progress = current["items"][0].get("progress") or {}
+            if progress.get("stage") == "sampling":
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("paper audit did not enter sampling")
+
+        paused = client.post(f"/api/v1/console/comparison-batches/{batch_id}/pause")
+        assert paused.status_code == 200
+        assert paused.json()["batch"]["status"] == "paused"
+        assert paused.json()["items"][0]["status"] == "paused"
+
+        resumed = client.post(f"/api/v1/console/comparison-batches/{batch_id}/resume")
+        assert resumed.status_code == 200
+        completed = _wait_for_comparison_batch(client, batch_id)
+        assert completed["items"][0]["status"] == "completed"
+        assert completed["items"][0]["verdict"] == "unverifiable"
+
+    assert audit_attempts == 2
 
 
 async def test_fingerprint_runner_passes_ephemeral_key_only_in_child_environment(
@@ -1950,6 +2308,68 @@ def test_auto_concurrency_ignores_tampered_history_then_trials_four(
         assert other_completed["items"][0]["task_options"]["concurrency_reason"].startswith(
             "暂无该中转站"
         )
+
+
+def test_auto_concurrency_treats_tampered_history_as_failed_observation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    reference_id = "00000000-0000-0000-0000-000000000215"
+    selected: list[int] = []
+    fingerprint = {
+        "formatVersion": 1,
+        "protocol": "one-token/v1",
+        "postReasoning": False,
+        "model": "adaptive-model",
+        "cells": {},
+    }
+
+    async def fake_verify(self, endpoint, *, output_path, **kwargs):
+        selected.append(kwargs["concurrency"])
+        output_path.write_text(json.dumps(fingerprint), encoding="utf-8")
+        return "match", _comparison_result(endpoint.model)
+
+    monkeypatch.setattr(FingerprintRunner, "verify", fake_verify)
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        evidence_dir=tmp_path / "evidence",
+        fingerprint_cli_path=Path("llm-fingerprint-detector/dist/cli.js"),
+    )
+    app = create_app(settings)
+    _install_fast_batch_preflight(app)
+    with TestClient(app) as client:
+        _register_reference(app, reference_id, fingerprint)
+        first = client.post(
+            "/api/v1/console/comparison-batches",
+            json=_comparison_batch_payload(
+                reference_id,
+                ("adaptive-model",),
+                concurrency=8,
+                concurrency_mode="auto",
+            ),
+        )
+        completed = _wait_for_comparison_batch(client, first.json()["batch"]["id"])
+        prior = app.state.database.get_run(completed["items"][0]["audit_id"])
+        assert prior is not None and prior.artifact_path
+        prior_path = Path(prior.artifact_path)
+        prior_path.write_bytes(prior_path.read_bytes() + b"\n")
+
+        second = client.post(
+            "/api/v1/console/comparison-batches",
+            json=_comparison_batch_payload(
+                reference_id,
+                ("adaptive-model",),
+                concurrency=8,
+                concurrency_mode="auto",
+            ),
+        )
+        second_completed = _wait_for_comparison_batch(
+            client,
+            second.json()["batch"]["id"],
+        )
+
+    assert selected == [2, 1]
+    assert "失败" in second_completed["items"][0]["task_options"]["concurrency_reason"]
 
 
 def test_uncertain_and_mismatch_identify_models_from_local_references_only(

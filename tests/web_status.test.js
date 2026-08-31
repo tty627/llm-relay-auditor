@@ -2,6 +2,188 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const status = require("../src/relay_auditor/web/status.js");
+const profiles = require("../src/relay_auditor/web/profiles.js");
+
+test("论文 V2 固定使用 canonical40 与每 cell 30 样本", () => {
+  const selected = profiles.settingsForProfile(
+    profiles.PAPER_PROFILE_ID,
+    { cells: 4, samples: 15, concurrency: 2 },
+  );
+
+  assert.equal(selected.methodProfileId, profiles.PAPER_PROFILE_ID);
+  assert.equal(selected.cells, 40);
+  assert.equal(selected.samples, 30);
+  assert.equal(selected.concurrency, 2);
+  assert.equal(profiles.requestCount(profiles.PAPER_PROFILE_ID, 2, selected), 2400);
+});
+
+test("参考后台批次请求发送模型列表、自动并发和两个超时", () => {
+  const payload = profiles.referenceCollectionRequest({
+    referenceName: " Official ",
+    endpoint: { base_url: "https://official.example/v1", api_key: "temporary" },
+    models: ["model-a", "model-a", " model-b "],
+    profileId: profiles.PAPER_PROFILE_ID,
+    settings: {
+      cells: 4,
+      samples: 15,
+      concurrency: 8,
+      concurrencyMode: "auto",
+      requestTimeoutSeconds: 21,
+      modelTimeoutSeconds: 420,
+    },
+    validDays: 30,
+  });
+
+  assert.deepEqual(payload, {
+    reference_name: "Official",
+    provider: "user_reference",
+    endpoint: { base_url: "https://official.example/v1", api_key: "temporary" },
+    models: ["model-a", "model-b"],
+    method_profile_id: profiles.PAPER_PROFILE_ID,
+    cells: 40,
+    samples: 30,
+    concurrency: 8,
+    concurrency_mode: "auto",
+    request_timeout_seconds: 21,
+    model_timeout_seconds: 420,
+    valid_days: 30,
+  });
+  assert.equal(Object.hasOwn(payload.endpoint, "model"), false);
+});
+
+test("409 结构化 detail 和纯文本都能恢复既有批次 ID", () => {
+  const batchId = "12345678-1234-1234-1234-123456789abc";
+  assert.equal(status.conflictBatchId({ detail: { message: "active", batch_id: batchId } }), batchId);
+  assert.equal(status.conflictBatchId(`已有批次 ${batchId}`), batchId);
+  assert.equal(status.conflictBatchId({ detail: { message: "missing id" } }), "");
+});
+
+test("参考采集摘要独立统计成功失败部分证据和当前模型", () => {
+  const summary = status.referenceCollectionSummary([
+    { model: "done", status: "completed" },
+    { model: "failed", status: "failed", partial_evidence: true, artifact_id: "partial" },
+    { model: "current", status: "running", progress: { stage: "sampling", done: 3, total: 30 } },
+    { model: "later", status: "queued" },
+  ]);
+
+  assert.equal(summary.success, 1);
+  assert.equal(summary.failed, 1);
+  assert.equal(summary.partial, 1);
+  assert.equal(summary.running, 1);
+  assert.equal(summary.queued, 1);
+  assert.equal(summary.currentModel, "current");
+});
+
+test("历史 raw JSONL 仅在 availability 或 SHA 存在时提供", () => {
+  const byFlag = status.rawSampleEvidenceInfo({
+    artifact_id: "artifact-a",
+    samples_evidence_available: true,
+  });
+  const bySha = status.rawSampleEvidenceInfo({
+    artifact_id: "artifact-b",
+    partial_evidence: true,
+    raw_evidence_sha256: "a".repeat(64),
+  });
+  const unavailable = status.rawSampleEvidenceInfo({ artifact_id: "artifact-c" });
+
+  assert.deepEqual(byFlag, { available: true, artifactId: "artifact-a", sha256: "" });
+  assert.equal(bySha.available, true);
+  assert.equal(bySha.artifactId, "artifact-b");
+  assert.equal(bySha.sha256, "a".repeat(64));
+  assert.equal(unavailable.available, false);
+});
+
+test("批次拒绝混合 V1 和 V2 参考且兼容缺少 profile 的旧记录", () => {
+  const legacy = { reference: { artifactId: "legacy" } };
+  const paper = {
+    reference: {
+      artifactId: "paper",
+      methodProfileId: profiles.PAPER_PROFILE_ID,
+    },
+  };
+
+  assert.equal(
+    profiles.mappingProfileSummary([legacy]).profileId,
+    profiles.LEGACY_PROFILE_ID,
+  );
+  const mixed = profiles.mappingProfileSummary([legacy, paper]);
+  assert.equal(mixed.compatible, false);
+  assert.match(mixed.message, /不能混合/);
+});
+
+test("历史指定参考缺失时保持未选择且不按同名模型回退", () => {
+  const references = [
+    { artifactId: "current-artifact", model: "gpt-test" },
+    { artifactId: "other-artifact", model: "other-model" },
+  ];
+
+  assert.deepEqual(
+    status.referenceSelection(references, "gpt-test", "deleted-history-artifact"),
+    { artifactId: "", preferredUnavailable: true },
+  );
+  assert.deepEqual(
+    status.referenceSelection(references, "gpt-test", ""),
+    { artifactId: "current-artifact", preferredUnavailable: false },
+  );
+});
+
+test("模型刷新合并发现结果并保留映射优先级启用状态和手工模型", () => {
+  const merged = status.mergeTargetModelMappings([
+    {
+      model: "still-listed",
+      referenceArtifactId: "artifact-1",
+      enabled: false,
+      priority: 80,
+      source: "discovered",
+    },
+    {
+      model: "manual-only",
+      referenceArtifactId: "artifact-2",
+      enabled: true,
+      priority: 20,
+      source: "manual",
+    },
+    {
+      model: "no-longer-listed",
+      referenceArtifactId: "artifact-3",
+      enabled: true,
+      priority: 50,
+      source: "discovered",
+    },
+  ], [{ id: "new-model" }, { id: "still-listed" }]);
+
+  assert.deepEqual(merged, [
+    {
+      model: "new-model",
+      source: "discovered",
+      missingFromDiscovery: false,
+    },
+    {
+      model: "still-listed",
+      referenceArtifactId: "artifact-1",
+      enabled: false,
+      priority: 80,
+      source: "discovered",
+      missingFromDiscovery: false,
+    },
+    {
+      model: "manual-only",
+      referenceArtifactId: "artifact-2",
+      enabled: true,
+      priority: 20,
+      source: "manual",
+      missingFromDiscovery: true,
+    },
+    {
+      model: "no-longer-listed",
+      referenceArtifactId: "artifact-3",
+      enabled: true,
+      priority: 50,
+      source: "discovered",
+      missingFromDiscovery: true,
+    },
+  ]);
+});
 
 test("历史指定参考缺失时保持未选择且不按同名模型回退", () => {
   const references = [

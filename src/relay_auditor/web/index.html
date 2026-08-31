@@ -8,6 +8,7 @@
     <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="/assets/styles.css">
     <script src="/assets/status.js" defer></script>
+    <script src="/assets/profiles.js" defer></script>
     <script src="/assets/app.js" defer></script>
   </head>
   <body>
@@ -106,10 +107,18 @@
               </div>
 
               <div class="settings-block">
+                <label class="profile-selector">
+                  <span>指纹方法</span>
+                  <select id="method-profile">
+                    <option value="bruckner-2026-canonical40/v1" selected>论文 V2 高保真 · 40 × 30</option>
+                    <option value="legacy-one-token/v1">旧版探索模式 · 使用下方规格</option>
+                  </select>
+                  <small id="method-profile-note" class="setting-note">作者固定 10×4 探针、直接采样并保存逐请求 JSONL；没有校准策略时只输出统计距离。</small>
+                </label>
                 <div class="field-row strategy-row">
                   <label>
                     <span>采样规格</span>
-                    <select id="preset">
+                    <select id="preset" disabled>
                       <option value="quick">快速 · 4 × 15</option>
                       <option value="standard" selected>标准 · 8 × 25</option>
                       <option value="strict">严格 · 16 × 25</option>
@@ -137,13 +146,13 @@
                     <input id="model-timeout" type="number" min="30" max="1800" value="300">
                   </label>
                 </div>
-                <small id="concurrency-note" class="setting-note">自动模式会按每个中转站的历史稳定性选择并发；连续无进度上限只在长期没有新响应时中断，不限制任务总时长。</small>
+                <small id="concurrency-note" class="setting-note">参考首模型从并发 ≤2 开始并按本批错误与重试升降；中转站对比按同端点与模型历史选择。连续无进度上限不限制任务总时长。</small>
                 <div class="cost-preview">
                   <span>当前预计请求</span>
                   <strong id="request-estimate">—</strong>
                   <span>预计采样时间</span>
                   <strong id="time-estimate">—</strong>
-                  <small id="time-estimate-note">首次按网络请求耗时粗估；完成模型后会用实际速度更新剩余时间。</small>
+                  <small id="time-estimate-note">自动模式下参考首项从并发 ≤2 开始；中转站对比优先采用历史稳定并发。</small>
                 </div>
               </div>
 
@@ -152,6 +161,25 @@
               </button>
             </form>
             <div id="reference-progress" class="reference-summary hidden" aria-live="polite"></div>
+            <section id="active-reference-panel" class="reference-collection-panel hidden" aria-live="polite">
+              <div class="reference-collection-heading">
+                <div>
+                  <span class="live-dot" aria-hidden="true"></span>
+                  <div>
+                    <strong id="active-reference-status">正在读取参考采集状态…</strong>
+                    <span id="active-reference-counts" class="batch-state-summary"></span>
+                  </div>
+                </div>
+                <div class="reference-collection-actions">
+                  <button id="retry-reference-recovery" class="button button-ghost hidden" type="button" data-allow-busy="true">重试恢复</button>
+                  <button id="pause-reference" class="button button-secondary" type="button" data-allow-busy="true">暂停采集</button>
+                  <button id="cancel-reference" class="button button-danger" type="button" data-allow-busy="true">取消采集</button>
+                </div>
+              </div>
+              <p id="active-reference-current" class="reference-collection-current"></p>
+              <div id="active-reference-list" class="reference-collection-list"></div>
+              <small class="reference-collection-note">参考采集由本地服务持续执行；刷新页面会重新关联任务，Key 不会写入工作区或证据。</small>
+            </section>
           </section>
 
           <section class="panel library-panel">
@@ -189,6 +217,7 @@
               <p id="mapping-time-estimate">预计耗时将在选择模型后显示。</p>
             </div>
             <div class="run-actions">
+              <button id="retry-comparison-recovery" class="button button-ghost hidden" type="button" data-allow-busy="true">重试恢复</button>
               <button id="pause-batch" class="button button-secondary hidden" type="button" data-allow-busy="true">暂停任务</button>
               <button id="cancel-batch" class="button button-danger hidden" type="button" data-allow-busy="true">取消批次</button>
               <button id="run-all" class="button button-primary" type="button" disabled>开始全部对比</button>

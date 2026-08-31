@@ -1,6 +1,21 @@
 from typing import Any, Literal
 
-from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import (
+    AnyHttpUrl,
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
+
+LEGACY_ONE_TOKEN_PROFILE = "legacy-one-token/v1"
+PAPER_ONE_TOKEN_PROFILE = "bruckner-2026-canonical40/v1"
+OneTokenMethodProfileId = Literal[
+    "legacy-one-token/v1",
+    "bruckner-2026-canonical40/v1",
+]
 
 
 def reject_url_userinfo(value: AnyHttpUrl) -> AnyHttpUrl:
@@ -28,9 +43,18 @@ class SmokeAuditRequest(BaseModel):
 
 class FingerprintCollectRequest(BaseModel):
     endpoint: EndpointSpec
-    cells: int = Field(default=4, ge=1, le=16)
+    method_profile_id: OneTokenMethodProfileId = LEGACY_ONE_TOKEN_PROFILE
+    cells: int = Field(default=4, ge=1, le=40)
     samples: int = Field(default=15, ge=10, le=100)
     concurrency: int = Field(default=6, ge=1, le=20)
+
+    @model_validator(mode="after")
+    def validate_profile_cells(self):
+        if self.method_profile_id == LEGACY_ONE_TOKEN_PROFILE and self.cells > 16:
+            raise ValueError("legacy-one-token/v1 supports at most 16 cells")
+        if self.method_profile_id == PAPER_ONE_TOKEN_PROFILE and self.cells != 40:
+            raise ValueError("bruckner-2026-canonical40/v1 requires exactly 40 cells")
+        return self
 
 
 class FingerprintVerifyRequest(FingerprintCollectRequest):
@@ -67,9 +91,18 @@ class EphemeralEndpointSpec(EphemeralConnectionSpec):
 
 class ConsoleFingerprintCollectRequest(BaseModel):
     endpoint: EphemeralEndpointSpec
-    cells: int = Field(default=4, ge=1, le=16)
+    method_profile_id: OneTokenMethodProfileId = LEGACY_ONE_TOKEN_PROFILE
+    cells: int = Field(default=4, ge=1, le=40)
     samples: int = Field(default=15, ge=10, le=100)
     concurrency: int = Field(default=4, ge=1, le=20)
+
+    @model_validator(mode="after")
+    def validate_profile_cells(self):
+        if self.method_profile_id == LEGACY_ONE_TOKEN_PROFILE and self.cells > 16:
+            raise ValueError("legacy-one-token/v1 supports at most 16 cells")
+        if self.method_profile_id == PAPER_ONE_TOKEN_PROFILE and self.cells != 40:
+            raise ValueError("bruckner-2026-canonical40/v1 requires exactly 40 cells")
+        return self
 
 
 class ConsoleComparisonBatchItemRequest(BaseModel):
@@ -90,7 +123,7 @@ class ConsoleComparisonBatchItemRequest(BaseModel):
 
 class ConsoleComparisonBatchRequest(BaseModel):
     items: list[ConsoleComparisonBatchItemRequest] = Field(min_length=1, max_length=500)
-    cells: int = Field(default=4, ge=1, le=16)
+    cells: int = Field(default=4, ge=1, le=40)
     samples: int = Field(default=15, ge=10, le=100)
     concurrency: int = Field(default=4, ge=1, le=20)
     concurrency_mode: Literal["auto", "fixed"] = "fixed"
@@ -119,6 +152,44 @@ class ConsoleReferenceCollectRequest(ConsoleFingerprintCollectRequest):
     reference_name: str = Field(min_length=1, max_length=60)
     provider: str = Field(default="user_reference", min_length=1, max_length=100)
     valid_days: int = Field(default=14, ge=1, le=90)
+
+
+class ConsoleReferenceCollectionRequest(BaseModel):
+    reference_name: str = Field(min_length=1, max_length=60)
+    provider: str = Field(default="user_reference", min_length=1, max_length=100)
+    endpoint: EphemeralConnectionSpec
+    models: list[str] = Field(min_length=1, max_length=200)
+    method_profile_id: OneTokenMethodProfileId = LEGACY_ONE_TOKEN_PROFILE
+    cells: int = Field(default=4, ge=1, le=40)
+    samples: int = Field(default=15, ge=10, le=100)
+    concurrency: int = Field(default=4, ge=1, le=20)
+    concurrency_mode: Literal["auto", "fixed"] = "fixed"
+    request_timeout_seconds: float = Field(default=15, ge=3, le=120)
+    model_timeout_seconds: float = Field(default=300, ge=30, le=1800)
+    valid_days: int = Field(default=14, ge=1, le=90)
+
+    @field_validator("models")
+    @classmethod
+    def validate_models(cls, values: list[str]) -> list[str]:
+        models: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            model = value.strip()
+            if not model or len(model) > 255:
+                raise ValueError("each model must contain 1 to 255 characters")
+            if model in seen:
+                raise ValueError(f"duplicate model: {model}")
+            seen.add(model)
+            models.append(model)
+        return models
+
+    @model_validator(mode="after")
+    def validate_profile_cells(self):
+        if self.method_profile_id == LEGACY_ONE_TOKEN_PROFILE and self.cells > 16:
+            raise ValueError("legacy-one-token/v1 supports at most 16 cells")
+        if self.method_profile_id == PAPER_ONE_TOKEN_PROFILE and self.cells != 40:
+            raise ValueError("bruckner-2026-canonical40/v1 requires exactly 40 cells")
+        return self
 
 
 class TokenizerCollectRequest(BaseModel):

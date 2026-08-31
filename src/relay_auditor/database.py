@@ -1,6 +1,6 @@
 import hashlib
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
@@ -9,6 +9,7 @@ from sqlalchemy import (
     JSON,
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -24,6 +25,15 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 
 class Base(DeclarativeBase):
     pass
+
+
+class ActiveBatchConflict(ValueError):
+    def __init__(self, batch_id: str, message: str) -> None:
+        self.batch_id = batch_id
+        super().__init__(message)
+
+
+ACTIVE_BATCH_STATUSES = {"running", "pausing", "paused", "canceling"}
 
 
 def isoformat_utc(value: datetime | None) -> str | None:
@@ -223,6 +233,90 @@ class ComparisonTaskOptions(Base):
         }
 
 
+class ReferenceCollectionBatch(Base):
+    __tablename__ = "reference_collection_batches"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    status: Mapped[str] = mapped_column(String(16), index=True, default="running")
+    reference_name: Mapped[str] = mapped_column(String(60))
+    provider: Mapped[str] = mapped_column(String(100))
+    base_url: Mapped[str] = mapped_column(Text)
+    method_profile_id: Mapped[str] = mapped_column(String(64), index=True)
+    total_items: Mapped[int] = mapped_column(Integer)
+    completed_items: Mapped[int] = mapped_column(Integer, default=0)
+    cells: Mapped[int] = mapped_column(Integer)
+    samples: Mapped[int] = mapped_column(Integer)
+    max_concurrency: Mapped[int] = mapped_column(Integer)
+    concurrency_mode: Mapped[str] = mapped_column(String(16))
+    request_timeout_seconds: Mapped[float] = mapped_column(Float)
+    model_timeout_seconds: Mapped[float] = mapped_column(Float)
+    valid_days: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "status": self.status,
+            "reference_name": self.reference_name,
+            "provider": self.provider,
+            "base_url": self.base_url,
+            "method_profile_id": self.method_profile_id,
+            "total_items": self.total_items,
+            "completed_items": self.completed_items,
+            "cells": self.cells,
+            "samples": self.samples,
+            "max_concurrency": self.max_concurrency,
+            "concurrency_mode": self.concurrency_mode,
+            "request_timeout_seconds": self.request_timeout_seconds,
+            "model_timeout_seconds": self.model_timeout_seconds,
+            "valid_days": self.valid_days,
+            "created_at": isoformat_utc(self.created_at),
+            "completed_at": isoformat_utc(self.completed_at),
+        }
+
+
+class ReferenceCollectionItem(Base):
+    __tablename__ = "reference_collection_items"
+
+    audit_id: Mapped[str] = mapped_column(ForeignKey("audit_runs.id"), primary_key=True)
+    batch_id: Mapped[str] = mapped_column(ForeignKey("reference_collection_batches.id"), index=True)
+    sequence: Mapped[int] = mapped_column(Integer)
+    model: Mapped[str] = mapped_column(String(255), index=True)
+    stage: Mapped[str] = mapped_column(String(32), index=True, default="queued")
+    done: Mapped[int] = mapped_column(Integer, default=0)
+    total: Mapped[int] = mapped_column(Integer, default=0)
+    errors: Mapped[int] = mapped_column(Integer, default=0)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    effective_concurrency: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    concurrency_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    baseline_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "audit_id": self.audit_id,
+            "batch_id": self.batch_id,
+            "sequence": self.sequence,
+            "model": self.model,
+            "stage": self.stage,
+            "done": self.done,
+            "total": self.total,
+            "errors": self.errors,
+            "retry_count": self.retry_count,
+            "detail": self.detail,
+            "effective_concurrency": self.effective_concurrency,
+            "concurrency_reason": self.concurrency_reason,
+            "baseline_id": self.baseline_id,
+            "created_at": isoformat_utc(self.created_at),
+            "updated_at": isoformat_utc(self.updated_at),
+            "finished_at": isoformat_utc(self.finished_at),
+        }
+
+
 class Database:
     def __init__(self, url: str) -> None:
         if url.startswith("sqlite:///") and not url.endswith(":memory:"):
@@ -410,7 +504,14 @@ class Database:
         concurrency: int,
         concurrency_mode: str,
     ) -> ComparisonBatch:
-        """Persist a complete queued comparison batch in one transaction."""
+        """Persist a complete queued comparison batch in one transaction.
+
+        A batch is only schedulable after every lifecycle row exists.  Keeping
+        the batch, audit runs, comparison records, progress rows, and task
+        options in one transaction prevents a partially-created queue from
+        being mistaken for recoverable work after a validation or database
+        failure.
+        """
 
         if not items:
             raise ValueError("comparison batch must contain at least one item")
@@ -426,6 +527,17 @@ class Database:
             created_at=now,
         )
         with self.sessions() as session:
+            active = session.scalar(
+                select(ComparisonBatch)
+                .where(ComparisonBatch.status.in_(ACTIVE_BATCH_STATUSES))
+                .order_by(ComparisonBatch.created_at.desc())
+                .limit(1)
+            )
+            if active is not None:
+                raise ActiveBatchConflict(
+                    active.id,
+                    "another comparison batch is already active",
+                )
             session.add(batch)
             for item in items:
                 audit_id = str(item["audit_id"])
@@ -525,6 +637,7 @@ class Database:
         done: int | None = None,
         total: int | None = None,
         errors: int | None = None,
+        retrying: bool = False,
         detail: str | None = None,
     ) -> ComparisonTaskProgress | None:
         with self.sessions() as session:
@@ -906,6 +1019,8 @@ class Database:
             select(ManagedEndpoint).where(ManagedEndpoint.name == candidate_name)
         )
         if existing_name is not None:
+            # An eight-character suffix is stable and normally sufficient. If
+            # it collides with another identity, deterministically lengthen it.
             for width in (8, 12, 16, 24, 32, 64):
                 suffix = f"-{digest[:width]}"
                 candidate_name = f"{name[: 100 - len(suffix)]}{suffix}"
@@ -1062,3 +1177,351 @@ class Database:
                 "valid_from": isoformat_utc(baseline.valid_from),
                 "expires_at": isoformat_utc(baseline.expires_at),
             }
+
+    def create_reference_collection_batch_queue(
+        self,
+        *,
+        batch_id: str,
+        audit_ids: list[str],
+        reference_name: str,
+        provider: str,
+        base_url: str,
+        models: list[str],
+        method_profile_id: str,
+        cells: int,
+        samples: int,
+        max_concurrency: int,
+        concurrency_mode: str,
+        request_timeout_seconds: float,
+        model_timeout_seconds: float,
+        valid_days: int,
+    ) -> ReferenceCollectionBatch:
+        if not models or len(models) != len(audit_ids):
+            raise ValueError("reference collection models and audit ids must be non-empty")
+        now = datetime.now(UTC)
+        batch = ReferenceCollectionBatch(
+            id=batch_id,
+            status="running",
+            reference_name=reference_name,
+            provider=provider,
+            base_url=base_url,
+            method_profile_id=method_profile_id,
+            total_items=len(models),
+            completed_items=0,
+            cells=cells,
+            samples=samples,
+            max_concurrency=max_concurrency,
+            concurrency_mode=concurrency_mode,
+            request_timeout_seconds=request_timeout_seconds,
+            model_timeout_seconds=model_timeout_seconds,
+            valid_days=valid_days,
+            created_at=now,
+        )
+        with self.sessions() as session:
+            active = session.scalar(
+                select(ReferenceCollectionBatch)
+                .where(ReferenceCollectionBatch.status.in_(ACTIVE_BATCH_STATUSES))
+                .order_by(ReferenceCollectionBatch.created_at.desc())
+                .limit(1)
+            )
+            if active is not None:
+                raise ActiveBatchConflict(
+                    active.id,
+                    "another reference collection batch is already active",
+                )
+            session.add(batch)
+            total = cells * samples
+            for sequence, (audit_id, model) in enumerate(zip(audit_ids, models, strict=True)):
+                session.add(
+                    AuditRun(
+                        id=audit_id,
+                        detector="one_token_collect",
+                        status="queued",
+                        target_base_url=base_url,
+                        model=model,
+                        started_at=now,
+                    )
+                )
+                session.add(
+                    ReferenceCollectionItem(
+                        audit_id=audit_id,
+                        batch_id=batch_id,
+                        sequence=sequence,
+                        model=model,
+                        stage="queued",
+                        done=0,
+                        total=total,
+                        errors=0,
+                        detail="已进入参考采集队列",
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+            session.commit()
+            session.refresh(batch)
+            return batch
+
+    def get_reference_collection_batch(
+        self,
+        batch_id: str,
+    ) -> ReferenceCollectionBatch | None:
+        with self.sessions() as session:
+            return session.get(ReferenceCollectionBatch, batch_id)
+
+    def latest_active_reference_collection_batch(
+        self,
+    ) -> ReferenceCollectionBatch | None:
+        with self.sessions() as session:
+            return session.scalar(
+                select(ReferenceCollectionBatch)
+                .where(ReferenceCollectionBatch.status.in_(ACTIVE_BATCH_STATUSES))
+                .order_by(ReferenceCollectionBatch.created_at.desc())
+                .limit(1)
+            )
+
+    def get_reference_collection_rows(
+        self,
+        batch_id: str,
+    ) -> list[tuple[AuditRun, ReferenceCollectionItem]]:
+        with self.sessions() as session:
+            statement = (
+                select(AuditRun, ReferenceCollectionItem)
+                .join(
+                    ReferenceCollectionItem,
+                    ReferenceCollectionItem.audit_id == AuditRun.id,
+                )
+                .where(ReferenceCollectionItem.batch_id == batch_id)
+                .order_by(ReferenceCollectionItem.sequence.asc())
+            )
+            return list(session.execute(statement).all())
+
+    def set_reference_collection_batch_status(
+        self,
+        batch_id: str,
+        status: str,
+    ) -> ReferenceCollectionBatch:
+        with self.sessions() as session:
+            batch = session.get(ReferenceCollectionBatch, batch_id)
+            if batch is None:
+                raise LookupError(f"reference collection batch not found: {batch_id}")
+            batch.status = status
+            batch.completed_at = (
+                datetime.now(UTC)
+                if status in {"completed", "failed", "canceled", "interrupted"}
+                else None
+            )
+            session.commit()
+            session.refresh(batch)
+            return batch
+
+    def update_reference_collection_progress(
+        self,
+        audit_id: str,
+        *,
+        stage: str,
+        done: int | None = None,
+        total: int | None = None,
+        errors: int | None = None,
+        retrying: bool = False,
+        detail: str | None = None,
+    ) -> ReferenceCollectionItem:
+        with self.sessions() as session:
+            item = session.get(ReferenceCollectionItem, audit_id)
+            if item is None:
+                raise LookupError(f"reference collection item not found: {audit_id}")
+            item.stage = stage
+            if done is not None:
+                item.done = max(0, done)
+            if total is not None:
+                item.total = max(0, total)
+            if errors is not None:
+                item.errors = max(0, errors)
+            if retrying:
+                item.retry_count += 1
+            item.detail = detail
+            item.updated_at = datetime.now(UTC)
+            session.commit()
+            session.refresh(item)
+            return item
+
+    def set_reference_collection_concurrency(
+        self,
+        audit_id: str,
+        *,
+        effective_concurrency: int,
+        reason: str,
+    ) -> ReferenceCollectionItem:
+        with self.sessions() as session:
+            item = session.get(ReferenceCollectionItem, audit_id)
+            if item is None:
+                raise LookupError(f"reference collection item not found: {audit_id}")
+            item.effective_concurrency = effective_concurrency
+            item.concurrency_reason = reason
+            item.updated_at = datetime.now(UTC)
+            session.commit()
+            session.refresh(item)
+            return item
+
+    @staticmethod
+    def _refresh_reference_batch_completion(
+        session: Session,
+        batch_id: str,
+        now: datetime,
+    ) -> None:
+        batch = session.get(ReferenceCollectionBatch, batch_id)
+        if batch is None:
+            return
+        finished = session.scalar(
+            select(func.count())
+            .select_from(ReferenceCollectionItem)
+            .where(
+                ReferenceCollectionItem.batch_id == batch_id,
+                ReferenceCollectionItem.finished_at.is_not(None),
+            )
+        )
+        batch.completed_items = min(batch.total_items, int(finished or 0))
+        if batch.completed_items >= batch.total_items and batch.status not in {
+            "canceled",
+            "failed",
+            "interrupted",
+        }:
+            batch.status = "completed"
+            batch.completed_at = now
+
+    def complete_reference_collection_item(
+        self,
+        audit_id: str,
+        *,
+        artifact_path: str,
+        artifact_sha256: str,
+        endpoint_id: str,
+        endpoint_name: str,
+        baseline_id: str,
+        metadata: dict[str, Any],
+    ) -> Baseline:
+        now = datetime.now(UTC)
+        with self.sessions() as session:
+            item = session.get(ReferenceCollectionItem, audit_id)
+            run = session.get(AuditRun, audit_id)
+            if item is None or run is None:
+                raise LookupError(f"reference collection item not found: {audit_id}")
+            batch = session.get(ReferenceCollectionBatch, item.batch_id)
+            if batch is None:
+                raise LookupError(f"reference collection batch not found: {item.batch_id}")
+            endpoint = self.upsert_endpoint_in_session(
+                session,
+                endpoint_id=endpoint_id,
+                name=endpoint_name,
+                provider=batch.provider,
+                base_url=batch.base_url,
+                model=item.model,
+                protocol="openai_chat",
+                now=now,
+            )
+            session.flush()
+            session.execute(
+                update(Baseline)
+                .where(
+                    Baseline.endpoint_id == endpoint.id,
+                    Baseline.detector == "one_token",
+                    Baseline.status == "active",
+                )
+                .values(status="superseded")
+            )
+            baseline = Baseline(
+                id=baseline_id,
+                endpoint_id=endpoint.id,
+                detector="one_token",
+                artifact_id=audit_id,
+                status="active",
+                valid_from=now,
+                expires_at=now + timedelta(days=batch.valid_days),
+                metadata_json=metadata,
+                created_at=now,
+            )
+            session.add(baseline)
+            run.status = "completed"
+            run.verdict = "recorded"
+            run.completed_at = now
+            run.artifact_path = artifact_path
+            run.artifact_sha256 = artifact_sha256
+            run.error_message = None
+            item.stage = "completed"
+            item.done = item.total
+            item.detail = "参考指纹采集完成"
+            item.baseline_id = baseline.id
+            item.updated_at = now
+            item.finished_at = now
+            self._refresh_reference_batch_completion(session, item.batch_id, now)
+            session.commit()
+            session.refresh(baseline)
+            return baseline
+
+    def finish_reference_collection_item(
+        self,
+        audit_id: str,
+        *,
+        status: str,
+        verdict: str,
+        detail: str,
+        artifact_path: str | None = None,
+        artifact_sha256: str | None = None,
+    ) -> ReferenceCollectionItem:
+        now = datetime.now(UTC)
+        with self.sessions() as session:
+            item = session.get(ReferenceCollectionItem, audit_id)
+            run = session.get(AuditRun, audit_id)
+            if item is None or run is None:
+                raise LookupError(f"reference collection item not found: {audit_id}")
+            run.status = status
+            run.verdict = verdict
+            run.completed_at = now
+            run.artifact_path = artifact_path
+            run.artifact_sha256 = artifact_sha256
+            run.error_message = detail
+            item.stage = status
+            item.detail = detail
+            item.updated_at = now
+            item.finished_at = now
+            self._refresh_reference_batch_completion(session, item.batch_id, now)
+            session.commit()
+            session.refresh(item)
+            return item
+
+    def interrupt_orphaned_reference_collections(self) -> int:
+        now = datetime.now(UTC)
+        interrupted = 0
+        with self.sessions() as session:
+            batches = list(
+                session.scalars(
+                    select(ReferenceCollectionBatch).where(
+                        ReferenceCollectionBatch.status.in_(ACTIVE_BATCH_STATUSES)
+                    )
+                )
+            )
+            for batch in batches:
+                items = list(
+                    session.scalars(
+                        select(ReferenceCollectionItem).where(
+                            ReferenceCollectionItem.batch_id == batch.id,
+                            ReferenceCollectionItem.finished_at.is_(None),
+                        )
+                    )
+                )
+                for item in items:
+                    run = session.get(AuditRun, item.audit_id)
+                    if run is not None:
+                        run.status = "interrupted"
+                        run.verdict = "interrupted"
+                        run.completed_at = now
+                        run.error_message = "服务重启，内存中的 API key 已清除"
+                    item.stage = "interrupted"
+                    item.detail = "服务重启，凭证已清除；请重新创建参考采集批次"
+                    item.updated_at = now
+                    item.finished_at = now
+                    interrupted += 1
+                batch.status = "interrupted"
+                batch.completed_items = batch.total_items
+                batch.completed_at = now
+            session.commit()
+        return interrupted

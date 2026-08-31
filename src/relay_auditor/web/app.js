@@ -5,6 +5,7 @@ const presets = {
 };
 
 const relayStatus = window.RelayStatus;
+const relayProfiles = window.RelayProfiles;
 const verdictLabels = {
   match: "较一致",
   uncertain: "不确定",
@@ -31,11 +32,24 @@ const state = {
   references: [],
   referenceModels: new Map(),
   observedRuns: [],
-  running: false,
+  running: true,
+  ready: false,
+  busySources: {
+    initialization: true,
+    transient: false,
+    reference: false,
+    comparison: false,
+  },
   targetSequence: 0,
+  activeReferenceCollectionId: null,
+  activeReferenceCollectionStatus: null,
+  referenceCollectionPollTimer: null,
+  referenceRecoveryBlocked: false,
   activeBatchId: null,
   activeBatchStatus: null,
   batchPollTimer: null,
+  comparisonRecoveryError: "",
+  comparisonRecoveryBlocked: false,
 };
 
 const elements = {
@@ -44,10 +58,20 @@ const elements = {
   referenceUrl: document.querySelector("#reference-url"),
   referenceKey: document.querySelector("#reference-key"),
   referenceManualModel: document.querySelector("#reference-manual-model"),
+  methodProfile: document.querySelector("#method-profile"),
+  methodProfileNote: document.querySelector("#method-profile-note"),
   referenceBadge: document.querySelector("#reference-badge"),
   referenceModelList: document.querySelector("#reference-model-list"),
   referenceModelCount: document.querySelector("#reference-model-count"),
   referenceProgress: document.querySelector("#reference-progress"),
+  activeReferencePanel: document.querySelector("#active-reference-panel"),
+  activeReferenceStatus: document.querySelector("#active-reference-status"),
+  activeReferenceCounts: document.querySelector("#active-reference-counts"),
+  activeReferenceCurrent: document.querySelector("#active-reference-current"),
+  activeReferenceList: document.querySelector("#active-reference-list"),
+  pauseReference: document.querySelector("#pause-reference"),
+  cancelReference: document.querySelector("#cancel-reference"),
+  retryReferenceRecovery: document.querySelector("#retry-reference-recovery"),
   referenceLibrary: document.querySelector("#reference-library"),
   referenceLibraryEmpty: document.querySelector("#reference-library-empty"),
   fetchReferenceModels: document.querySelector("#fetch-reference-models"),
@@ -69,6 +93,7 @@ const elements = {
   mappingTemplate: document.querySelector("#mapping-template"),
   addTarget: document.querySelector("#add-target"),
   runAll: document.querySelector("#run-all"),
+  retryComparisonRecovery: document.querySelector("#retry-comparison-recovery"),
   pauseBatch: document.querySelector("#pause-batch"),
   cancelBatch: document.querySelector("#cancel-batch"),
   activeBatchPanel: document.querySelector("#active-batch-panel"),
@@ -93,6 +118,7 @@ function workspaceSnapshot() {
       name: elements.referenceName.value,
       baseUrl: elements.referenceUrl.value,
       manualModel: elements.referenceManualModel.value,
+      methodProfileId: elements.methodProfile.value,
       models: [...state.referenceModels.entries()].map(([model, selected]) => ({
         model,
         selected,
@@ -154,6 +180,9 @@ function restoreWorkspace() {
   elements.referenceName.value = saved.reference?.name || "";
   elements.referenceUrl.value = saved.reference?.baseUrl || "";
   elements.referenceManualModel.value = saved.reference?.manualModel || "";
+  elements.methodProfile.value = relayProfiles.normalizeProfileId(
+    saved.reference?.methodProfileId,
+  );
   state.referenceModels.clear();
   (saved.reference?.models || []).forEach((item) => {
     if (item?.model) state.referenceModels.set(item.model, Boolean(item.selected));
@@ -188,6 +217,7 @@ function seedDefaultWorkspace() {
   elements.referenceName.value = "Local Mock";
   elements.referenceUrl.value = "http://127.0.0.1:8000/mock/v1";
   elements.referenceManualModel.value = "reference-model";
+  elements.methodProfile.value = relayProfiles.PAPER_PROFILE_ID;
   elements.preset.value = "standard";
   elements.concurrencyMode.value = "auto";
   elements.concurrency.value = "4";
@@ -201,9 +231,9 @@ function seedDefaultWorkspace() {
   renderReferenceModelPicker();
 }
 
-function settings() {
+function settings(profileId = elements.methodProfile.value) {
   const preset = presets[elements.preset.value] || presets.standard;
-  return {
+  const legacySettings = {
     cells: preset.cells,
     samples: preset.samples,
     concurrencyMode: elements.concurrencyMode.value === "fixed" ? "fixed" : "auto",
@@ -211,6 +241,7 @@ function settings() {
     requestTimeoutSeconds: Number(elements.requestTimeout.value) || 15,
     modelTimeoutSeconds: Number(elements.modelTimeout.value) || 300,
   };
+  return relayProfiles.settingsForProfile(profileId, legacySettings);
 }
 
 function targetCards() {
@@ -250,8 +281,14 @@ async function requestJson(path, options = {}) {
     const rawDetail = body?.detail;
     const detail = Array.isArray(rawDetail)
       ? rawDetail.map((item) => item.msg || JSON.stringify(item)).join("；")
-      : rawDetail || `HTTP ${response.status}`;
-    throw new Error(detail);
+      : rawDetail && typeof rawDetail === "object"
+        ? rawDetail.message || JSON.stringify(rawDetail)
+        : rawDetail || `HTTP ${response.status}`;
+    const error = new Error(detail);
+    error.status = response.status;
+    error.detail = rawDetail;
+    error.body = body;
+    throw error;
   }
   return body;
 }
@@ -349,13 +386,15 @@ function adapterText(adapter) {
   return adapter.strategy || "none";
 }
 
-function setBusy(busy) {
-  state.running = busy;
-  document.body.classList.toggle("is-busy", busy);
+function setBusy(busy, source = "transient") {
+  state.busySources[source] = Boolean(busy);
+  const anyBusy = Object.values(state.busySources).some(Boolean);
+  state.running = anyBusy;
+  document.body.classList.toggle("is-busy", anyBusy);
   document.querySelectorAll("button, input, select").forEach((node) => {
-    node.disabled = busy && node.dataset.allowBusy !== "true";
+    node.disabled = anyBusy && node.dataset.allowBusy !== "true";
   });
-  if (!busy) updateControls();
+  if (!anyBusy) updateControls();
 }
 
 function normalizeReference(item) {
@@ -378,6 +417,14 @@ function normalizeReference(item) {
     cells: Number(metadata.cells) || null,
     samples: Number(metadata.samples) || null,
     concurrency: Number(metadata.concurrency) || null,
+    methodProfileId: relayProfiles.normalizeProfileId(
+      item.method_profile_id || metadata.method_profile_id,
+    ),
+    protocol: item.protocol || metadata.protocol || "one-token/v1",
+    samplesEvidenceAvailable: Boolean(
+      item.samples_evidence_available || metadata.samples_evidence_available,
+    ),
+    rawEvidenceSha256: item.raw_evidence_sha256 || metadata.raw_evidence_sha256 || "",
   };
 }
 
@@ -459,8 +506,10 @@ function renderReferenceLibrary() {
     model.textContent = reference.model;
     title.append(name, model);
     const status = document.createElement("span");
-    status.className = "badge badge-match";
-    status.textContent = "Active";
+    status.className = reference.methodProfileId === relayProfiles.PAPER_PROFILE_ID
+      ? "badge badge-running"
+      : "badge badge-muted";
+    status.textContent = relayProfiles.profile(reference.methodProfileId).shortLabel;
     heading.append(title, status);
 
     const endpoint = document.createElement("p");
@@ -471,8 +520,10 @@ function renderReferenceLibrary() {
     [
       ["采集时间", formatDate(reference.validFrom)],
       ["采样耗时", reference.durationMs === null ? "—" : formatClockDuration(reference.durationMs)],
+      ["指纹协议", relayProfiles.profile(reference.methodProfileId).label],
       ["有效期至", formatDate(reference.expiresAt)],
       ["SHA-256", reference.sha256 ? reference.sha256.slice(0, 16) : "—"],
+      ["原始证据", reference.rawEvidenceSha256 ? reference.rawEvidenceSha256.slice(0, 16) : "—"],
     ].forEach(([key, value]) => {
       const dt = document.createElement("dt");
       const dd = document.createElement("dd");
@@ -494,6 +545,13 @@ function renderReferenceLibrary() {
       download.href = `/api/v1/console/evidence/${reference.artifactId}`;
       download.textContent = "下载指纹 JSON";
       actionButtons.append(download);
+    }
+    if (reference.samplesEvidenceAvailable) {
+      const samplesDownload = document.createElement("a");
+      samplesDownload.className = "evidence-link";
+      samplesDownload.href = `/api/v1/console/evidence/${reference.artifactId}/samples`;
+      samplesDownload.textContent = "下载原始 JSONL";
+      actionButtons.append(samplesDownload);
     }
     const remove = document.createElement("button");
     remove.type = "button";
@@ -569,132 +627,375 @@ function showReferenceProgress(message, level = "normal") {
   elements.referenceProgress.textContent = message;
 }
 
-function startRunTimer(total, current, onTick) {
-  const estimate = estimateDuration(1, current);
-  const timing = {
-    total,
-    completed: 0,
-    startedAt: performance.now(),
-    currentStartedAt: null,
-    currentLabel: "",
-    initialPerModelMs: estimate.perModelMs,
-    durations: [],
-    current,
-    onTick,
-    interval: null,
-  };
-  timing.interval = window.setInterval(() => tickRunTimer(timing), 1000);
-  return timing;
+function referenceCollectionIsTerminal(status) {
+  return ["completed", "failed", "canceled", "interrupted"].includes(String(status || ""));
 }
 
-function currentPerModelEstimate(timing) {
-  return median(timing.durations) || timing.initialPerModelMs;
-}
-
-function tickRunTimer(timing) {
-  const now = performance.now();
-  const elapsedMs = now - timing.startedAt;
-  const perModelMs = currentPerModelEstimate(timing);
-  const unfinished = Math.max(0, timing.total - timing.completed);
-  let remainingMs = perModelMs * unfinished;
-  let estimateExceeded = false;
-  if (timing.currentStartedAt !== null && unfinished > 0) {
-    const currentElapsed = now - timing.currentStartedAt;
-    estimateExceeded = currentElapsed >= perModelMs;
-    remainingMs = estimateExceeded
-      ? null
-      : perModelMs - currentElapsed + perModelMs * (unfinished - 1);
+function referenceItemProgressText(item) {
+  const progress = item.progress || {};
+  const partial = relayStatus.partialEvidenceInfo(item);
+  const retry = relayStatus.retryWaitingText(item);
+  if (retry) return retry;
+  if (item.status === "completed") return progress.detail || "参考指纹与证据已保存";
+  if (item.status === "failed" || item.status === "interrupted") {
+    const message = item.error_message || progress.detail || "参考采集未完成";
+    const partialText = relayStatus.incompleteEvidenceText(partial);
+    return partialText ? `${message} · ${partialText}` : message;
   }
-  timing.onTick({
-    completed: timing.completed,
-    total: timing.total,
-    currentLabel: timing.currentLabel,
-    elapsedMs,
-    remainingMs,
-    estimateExceeded,
+  if (item.status === "canceled") {
+    const partialText = relayStatus.incompleteEvidenceText(partial);
+    return partialText ? `已取消 · ${partialText}` : "已取消，尚未产生可用参考指纹";
+  }
+  if (item.status === "paused") return progress.detail || "采集已暂停，可继续或取消";
+  if (item.status === "canceling") return progress.detail || "正在停止当前采样请求";
+  if (progress.stage === "sampling") {
+    return `已收到 ${Number(progress.done) || 0}/${Number(progress.total) || 0} 个采样响应${progress.errors ? ` · ${progress.errors} 个错误` : ""}`;
+  }
+  return progress.detail || (item.status === "queued" ? "排队等待采集" : "正在准备参考采集");
+}
+
+function referenceItemStatus(item) {
+  const operational = relayStatus.itemOperationalState(item);
+  if (operational === "success") return { className: "match", label: "已保存" };
+  if (operational === "failed") return { className: "error", label: "失败" };
+  if (operational === "waiting") return { className: "waiting", label: relayStatus.itemStatusLabel(item) };
+  if (operational === "canceled") return { className: "muted", label: "已取消" };
+  if (operational === "paused") return { className: "uncertain", label: "已暂停" };
+  if (operational === "running") return { className: "running", label: "采集中" };
+  return { className: "muted", label: "排队 / 未执行" };
+}
+
+function renderReferenceCollectionItem(item) {
+  const progress = item.progress || {};
+  const partial = relayStatus.partialEvidenceInfo(item);
+  const raw = relayStatus.rawSampleEvidenceInfo(item);
+  const done = Number(progress.done) || 0;
+  const total = Number(progress.total) || 0;
+  const percent = total > 0 ? Math.min(100, (done / total) * 100) : 0;
+  const statusInfo = referenceItemStatus(item);
+  const task = document.createElement("article");
+  task.className = `active-task${relayStatus.itemOperationalState(item) === "waiting" ? " is-waiting-retry" : ""}`;
+
+  const name = document.createElement("div");
+  name.className = "active-task-name";
+  const label = document.createElement("strong");
+  const model = document.createElement("code");
+  label.textContent = "参考模型";
+  model.textContent = item.model || "未知模型";
+  name.append(label, model);
+
+  const progressBox = document.createElement("div");
+  progressBox.className = "active-task-progress";
+  const description = document.createElement("p");
+  description.textContent = referenceItemProgressText(item);
+  const diagnostics = document.createElement("small");
+  diagnostics.className = "task-network-diagnostics";
+  diagnostics.textContent = relayStatus.progressDiagnostics(item).join(" · ");
+  diagnostics.classList.toggle("hidden", !diagnostics.textContent);
+  const track = document.createElement("div");
+  track.className = "task-progress-track";
+  const fill = document.createElement("i");
+  fill.style.width = `${percent}%`;
+  track.append(fill);
+  progressBox.append(description, diagnostics, track);
+
+  const meta = document.createElement("div");
+  meta.className = "active-task-meta";
+  const status = document.createElement("strong");
+  status.className = `badge badge-${statusInfo.className}`;
+  status.textContent = statusInfo.label;
+  const updated = document.createElement("span");
+  updated.textContent = progress.updated_at ? `更新于 ${formatDate(progress.updated_at)}` : "等待首次更新";
+  const concurrency = document.createElement("span");
+  const effective = Number(item.effective_concurrency);
+  concurrency.textContent = Number.isFinite(effective) && effective > 0
+    ? `实际并发 ${effective}${item.concurrency_reason ? ` · ${item.concurrency_reason}` : ""}`
+    : item.concurrency_reason || "等待选择并发";
+  const retries = document.createElement("span");
+  const retryCount = Number(item.retry_count);
+  retries.textContent = Number.isFinite(retryCount) && retryCount > 0
+    ? `已重试 ${retryCount} 次`
+    : "尚无重试";
+  meta.append(status, updated, concurrency, retries);
+  task.append(name, progressBox, meta);
+
+  const actions = document.createElement("div");
+  actions.className = "active-task-actions";
+  if (item.artifact_id) {
+    const evidence = document.createElement("a");
+    evidence.className = `button button-ghost${partial.isPartial ? " partial-evidence-link" : ""}`;
+    evidence.href = `/api/v1/console/evidence/${item.artifact_id}`;
+    evidence.textContent = partial.isPartial ? "下载部分指纹 JSON" : "下载指纹 JSON";
+    if (partial.isPartial) evidence.title = relayStatus.incompleteEvidenceText(partial);
+    actions.append(evidence);
+  }
+  if (raw.available) {
+    const samples = document.createElement("a");
+    samples.className = "button button-ghost partial-evidence-link";
+    samples.href = `/api/v1/console/evidence/${raw.artifactId}/samples`;
+    samples.textContent = partial.isPartial ? "下载部分原始 JSONL" : "下载原始 JSONL";
+    if (raw.sha256) samples.title = `SHA-256 ${raw.sha256}`;
+    actions.append(samples);
+  }
+  if (actions.childElementCount) task.append(actions);
+  return task;
+}
+
+function renderReferenceCollection(body, { recovered = false } = {}) {
+  const batch = body?.batch;
+  if (!batch) {
+    state.referenceRecoveryBlocked = false;
+    elements.retryReferenceRecovery.classList.add("hidden");
+    elements.retryReferenceRecovery.disabled = false;
+    state.activeReferenceCollectionId = null;
+    state.activeReferenceCollectionStatus = null;
+    elements.activeReferencePanel.classList.add("hidden");
+    window.clearTimeout(state.referenceCollectionPollTimer);
+    state.referenceCollectionPollTimer = null;
+    setBusy(false, "reference");
+    return;
+  }
+
+  const previousStatus = state.activeReferenceCollectionStatus;
+  const items = Array.isArray(body.items) ? body.items : [];
+  const summary = relayStatus.referenceCollectionSummary(items);
+  state.activeReferenceCollectionId = batch.id;
+  state.activeReferenceCollectionStatus = batch.status;
+  state.referenceRecoveryBlocked = false;
+  elements.retryReferenceRecovery.classList.add("hidden");
+  elements.retryReferenceRecovery.disabled = false;
+  const terminal = referenceCollectionIsTerminal(batch.status);
+  const active = !terminal;
+  elements.activeReferencePanel.classList.remove(
+    "hidden", "is-paused", "is-complete", "is-canceled", "is-mixed",
+  );
+  elements.activeReferencePanel.classList.toggle("is-paused", batch.status === "paused");
+  elements.activeReferencePanel.classList.toggle("is-complete", batch.status === "completed");
+  elements.activeReferencePanel.classList.toggle("is-canceled", batch.status === "canceled");
+  elements.activeReferencePanel.classList.toggle(
+    "is-mixed",
+    summary.failed > 0 || summary.canceled > 0 || summary.partial > 0,
+  );
+  const statusText = relayStatus.batchStatusLabel(batch.status, summary);
+  elements.activeReferenceStatus.textContent = `${recovered ? "已恢复 · " : ""}${statusText}`;
+  elements.activeReferenceCounts.replaceChildren();
+  [
+    ["success", "成功", summary.success],
+    ["failed", "失败", summary.failed],
+    ["partial", "部分证据", summary.partial],
+    ["canceled", "取消", summary.canceled],
+    ["queued", "排队", summary.queued],
+    ["running", "运行", summary.running],
+    ["paused", "暂停", summary.paused],
+  ].forEach(([key, label, count]) => {
+    const node = document.createElement("span");
+    node.className = `batch-state-count is-${key}`;
+    node.textContent = `${label} ${count}`;
+    elements.activeReferenceCounts.append(node);
   });
-}
+  elements.activeReferenceCurrent.textContent = summary.currentModel
+    ? `当前模型：${summary.currentModel} · 已完成 ${Number(batch.completed_items) || summary.success}/${Number(batch.total_items) || items.length}`
+    : `已完成 ${Number(batch.completed_items) || summary.success}/${Number(batch.total_items) || items.length}`;
+  elements.activeReferenceList.replaceChildren();
+  items.forEach((item) => elements.activeReferenceList.append(renderReferenceCollectionItem(item)));
 
-function startTimedModel(timing, label) {
-  timing.currentLabel = label;
-  timing.currentStartedAt = performance.now();
-  tickRunTimer(timing);
-}
+  elements.referenceBadge.className = terminal
+    ? summary.failed || summary.partial ? "badge badge-uncertain" : "badge badge-match"
+    : batch.status === "paused" ? "badge badge-uncertain" : "badge badge-running";
+  elements.referenceBadge.textContent = terminal
+    ? `${summary.success} 成功 / ${summary.failed} 失败`
+    : summary.currentModel ? `正在采集 ${summary.currentModel}` : statusText;
+  showReferenceProgress(
+    `${statusText} · 成功 ${summary.success}、失败 ${summary.failed}、部分证据 ${summary.partial}、排队 ${summary.queued}。刷新页面会自动恢复此任务。`,
+    batch.status === "failed" ? "error" : "normal",
+  );
 
-function finishTimedModel(timing, succeeded) {
-  const now = performance.now();
-  if (timing.currentStartedAt !== null) {
-    const durationMs = now - timing.currentStartedAt;
-    timing.durations.push(durationMs);
-    if (succeeded) {
-      state.observedRuns.push({ durationMs, ...timing.current });
-    }
+  setBusy(active, "reference");
+  const pauseable = ["running", "pausing", "paused"].includes(batch.status);
+  const cancelable = ["running", "pausing", "paused", "canceling"].includes(batch.status);
+  elements.pauseReference.classList.toggle("hidden", !pauseable);
+  elements.cancelReference.classList.toggle("hidden", !cancelable);
+  elements.pauseReference.disabled = !pauseable || batch.status === "pausing";
+  elements.cancelReference.disabled = !cancelable || batch.status === "canceling";
+  elements.pauseReference.textContent = batch.status === "paused" ? "继续采集" : "暂停采集";
+
+  if (terminal) {
+    window.clearTimeout(state.referenceCollectionPollTimer);
+    state.referenceCollectionPollTimer = null;
+    if (previousStatus && !referenceCollectionIsTerminal(previousStatus)) loadReferences();
   }
-  timing.completed += 1;
-  timing.currentStartedAt = null;
-  timing.currentLabel = "";
-  tickRunTimer(timing);
 }
 
-function stopRunTimer(timing) {
-  window.clearInterval(timing.interval);
-  return performance.now() - timing.startedAt;
+function scheduleReferenceCollectionPoll(delay = 1000) {
+  window.clearTimeout(state.referenceCollectionPollTimer);
+  if (!state.activeReferenceCollectionId
+    || referenceCollectionIsTerminal(state.activeReferenceCollectionStatus)) return;
+  state.referenceCollectionPollTimer = window.setTimeout(pollReferenceCollection, delay);
 }
 
-function progressTimingText(progress) {
-  const remaining = progress.estimateExceeded
-    ? "暂不可估（当前任务已超出初始估算）"
-    : formatClockDuration(progress.remainingMs);
-  return `已完成 ${progress.completed}/${progress.total} · 已用 ${formatClockDuration(progress.elapsedMs)} · 预计还需 ${remaining}`;
+async function pollReferenceCollection() {
+  if (!state.activeReferenceCollectionId) return;
+  try {
+    const body = await requestJson(
+      `/api/v1/console/reference-collections/${state.activeReferenceCollectionId}`,
+    );
+    renderReferenceCollection(body);
+    scheduleReferenceCollectionPoll();
+  } catch (error) {
+    elements.activeReferencePanel.classList.remove("hidden");
+    elements.activeReferenceStatus.textContent = `参考采集状态读取失败：${error instanceof Error ? error.message : String(error)}`;
+    showReferenceProgress(elements.activeReferenceStatus.textContent, "error");
+    scheduleReferenceCollectionPoll(3000);
+  }
+}
+
+async function recoverReferenceCollection(collectionId, message = "已恢复正在执行的参考采集") {
+  const body = await requestJson(`/api/v1/console/reference-collections/${collectionId}`);
+  state.referenceRecoveryBlocked = false;
+  renderReferenceCollection(body, { recovered: true });
+  showReferenceProgress(`${message} · 批次 ${String(collectionId).slice(0, 8)}`);
+  scheduleReferenceCollectionPoll();
+  return true;
+}
+
+async function loadActiveReferenceCollection() {
+  state.referenceRecoveryBlocked = true;
+  elements.retryReferenceRecovery.disabled = true;
+  updateControls();
+  try {
+    const body = await requestJson("/api/v1/console/reference-collections/active");
+    if (!body?.batch) {
+      renderReferenceCollection({ batch: null, items: [] });
+      return false;
+    }
+    renderReferenceCollection(body, { recovered: true });
+    scheduleReferenceCollectionPoll();
+    return true;
+  } catch (error) {
+    state.referenceRecoveryBlocked = true;
+    setBusy(false, "reference");
+    elements.activeReferencePanel.classList.remove("hidden");
+    elements.retryReferenceRecovery.classList.remove("hidden");
+    elements.retryReferenceRecovery.disabled = false;
+    elements.pauseReference.classList.add("hidden");
+    elements.cancelReference.classList.add("hidden");
+    elements.activeReferenceStatus.textContent = `参考采集恢复失败：${error instanceof Error ? error.message : String(error)}`;
+    elements.activeReferenceCurrent.textContent = "无法确认是否已有任务；请先检查本地服务并点击“重试恢复”，确认完成前不会允许创建新批次。";
+    showReferenceProgress(elements.activeReferenceStatus.textContent, "error");
+    return false;
+  }
 }
 
 async function collectReferences(event) {
   event.preventDefault();
-  if (!elements.referenceForm.reportValidity()) return;
+  if (!state.ready || state.running || state.referenceRecoveryBlocked
+    || !elements.referenceForm.reportValidity()) return;
   const models = selectedReferenceModels();
   if (!models.length) {
     showReferenceProgress("请至少选择一个待采集模型。", "error");
     return;
   }
-  setBusy(true);
   const current = settings();
-  const timing = startRunTimer(models.length, current, (progress) => {
-    const model = progress.currentLabel ? `正在采集 ${progress.currentLabel} · ` : "";
-    showReferenceProgress(`${model}${progressTimingText(progress)}`);
+  const payload = relayProfiles.referenceCollectionRequest({
+    referenceName: elements.referenceName.value,
+    endpoint: connectionPayload(elements.referenceUrl, elements.referenceKey),
+    models,
+    profileId: current.methodProfileId,
+    settings: current,
+    validDays: 14,
   });
-  let completed = 0;
-  let failed = 0;
-  for (const [index, model] of models.entries()) {
-    elements.referenceBadge.className = "badge badge-running";
-    elements.referenceBadge.textContent = `第 ${index + 1}/${models.length} 个`;
-    startTimedModel(timing, model);
-    let succeeded = false;
-    try {
-      await postJson("/api/v1/console/references/collect", {
-        reference_name: elements.referenceName.value.trim(),
-        provider: "user_reference",
-        endpoint: endpointPayload(elements.referenceUrl, model, elements.referenceKey),
-        ...current,
-      });
-      completed += 1;
-      succeeded = true;
-    } catch (error) {
-      failed += 1;
+  setBusy(true, "reference");
+  elements.referenceBadge.className = "badge badge-running";
+  elements.referenceBadge.textContent = "正在创建后台批次";
+  showReferenceProgress(`正在提交 ${models.length} 个参考模型；创建后刷新页面也会继续执行。`);
+  try {
+    const body = await postJson("/api/v1/console/reference-collections", payload);
+    renderReferenceCollection(body);
+    scheduleReferenceCollectionPoll();
+  } catch (error) {
+    const existingId = error?.status === 409 ? relayStatus.conflictBatchId(error) : "";
+    if (existingId) {
+      try {
+        await recoverReferenceCollection(existingId, "检测到已有参考采集，已重新关联");
+        return;
+      } catch (recoveryError) {
+        state.referenceRecoveryBlocked = true;
+        elements.activeReferencePanel.classList.remove("hidden");
+        elements.retryReferenceRecovery.classList.remove("hidden");
+        elements.retryReferenceRecovery.disabled = false;
+        elements.pauseReference.classList.add("hidden");
+        elements.cancelReference.classList.add("hidden");
+        elements.activeReferenceStatus.textContent = `已有参考采集 ${existingId}，但恢复失败`;
+        elements.activeReferenceCurrent.textContent = "请检查本地服务并点击“重试恢复”；确认完成前不会允许创建新批次。";
+        showReferenceProgress(
+          `已有参考采集 ${existingId}，但恢复失败：${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`,
+          "error",
+        );
+      }
+    } else if (error?.status === 409) {
+      state.referenceRecoveryBlocked = true;
+      elements.activeReferencePanel.classList.remove("hidden");
+      elements.retryReferenceRecovery.classList.remove("hidden");
+      elements.retryReferenceRecovery.disabled = false;
+      elements.pauseReference.classList.add("hidden");
+      elements.cancelReference.classList.add("hidden");
+      elements.activeReferenceStatus.textContent = "后端报告已有参考采集，但未返回批次 ID";
+      elements.activeReferenceCurrent.textContent = "请点击“重试恢复”从活动任务接口重新关联；确认完成前不会允许创建新批次。";
       showReferenceProgress(
-        `${model} 采集失败：${error instanceof Error ? error.message : String(error)}`,
+        `参考采集任务冲突：${error instanceof Error ? error.message : String(error)}`,
+        "error",
+      );
+    } else {
+      showReferenceProgress(
+        `参考采集任务创建失败：${error instanceof Error ? error.message : String(error)}`,
         "error",
       );
     }
-    finishTimedModel(timing, succeeded);
+    setBusy(false, "reference");
+    elements.referenceBadge.className = "badge badge-error";
+    elements.referenceBadge.textContent = "创建失败";
   }
-  const elapsedMs = stopRunTimer(timing);
-  await loadReferences();
-  elements.referenceBadge.className = failed ? "badge badge-uncertain" : "badge badge-match";
-  elements.referenceBadge.textContent = failed ? `${completed} 成功 / ${failed} 失败` : `已保存 ${completed} 个`;
-  if (!failed) {
-    showReferenceProgress(`已保存 ${completed} 个参考模型 · 总耗时 ${formatClockDuration(elapsedMs)}。旧版本仍保留在本地证据目录。`);
+}
+
+async function pauseOrResumeReferenceCollection() {
+  if (!state.activeReferenceCollectionId) return;
+  elements.pauseReference.disabled = true;
+  const action = state.activeReferenceCollectionStatus === "paused" ? "resume" : "pause";
+  try {
+    const body = await postJson(
+      `/api/v1/console/reference-collections/${state.activeReferenceCollectionId}/${action}`,
+      {},
+    );
+    renderReferenceCollection(body);
+    scheduleReferenceCollectionPoll();
+  } catch (error) {
+    elements.activeReferenceStatus.textContent = `参考采集操作失败：${error instanceof Error ? error.message : String(error)}`;
+    elements.pauseReference.disabled = false;
   }
-  setBusy(false);
+}
+
+async function cancelReferenceCollection() {
+  if (!state.activeReferenceCollectionId) return;
+  const confirmed = window.confirm("取消参考采集？已完成与部分采样证据会保留，尚未执行的模型将停止。");
+  if (!confirmed) return;
+  elements.cancelReference.disabled = true;
+  try {
+    const body = await postJson(
+      `/api/v1/console/reference-collections/${state.activeReferenceCollectionId}/cancel`,
+      {},
+    );
+    renderReferenceCollection(body);
+    scheduleReferenceCollectionPoll();
+  } catch (error) {
+    elements.activeReferenceStatus.textContent = `取消参考采集失败：${error instanceof Error ? error.message : String(error)}`;
+    elements.cancelReference.disabled = false;
+  }
+}
+
+async function retryReferenceRecovery() {
+  elements.retryReferenceRecovery.disabled = true;
+  showReferenceProgress("正在重新检查后台参考采集…");
+  await loadActiveReferenceCollection();
 }
 
 function populateReferenceSelect(select, targetModel, preferredArtifactId = "") {
@@ -712,7 +1013,7 @@ function populateReferenceSelect(select, targetModel, preferredArtifactId = "") 
   sorted.forEach((reference) => {
     const option = document.createElement("option");
     option.value = reference.artifactId;
-    option.textContent = `${reference.name} · ${reference.model}`;
+    option.textContent = `[${relayProfiles.profile(reference.methodProfileId).shortLabel}] ${reference.name} · ${reference.model}`;
     select.append(option);
   });
   const selection = relayStatus.referenceSelection(
@@ -753,9 +1054,10 @@ function updateMappingStatus(row) {
     ? "mapping-state badge badge-match"
     : "mapping-state badge badge-muted";
   const mappedText = enabled.checked ? "已启用" : "已映射";
+  const profileText = relayProfiles.profile(reference.methodProfileId).shortLabel;
   status.textContent = row.dataset.missingFromDiscovery === "true"
-    ? `${mappedText} · 未发现`
-    : mappedText;
+    ? `${mappedText} · ${profileText} · 未发现`
+    : `${mappedText} · ${profileText}`;
   status.title = row.dataset.missingFromDiscovery === "true"
     ? "最新模型列表未返回此模型，已保留其原有映射。"
     : "";
@@ -930,32 +1232,61 @@ function selectedMappings() {
 function updateControls() {
   const referenceSelected = selectedReferenceModels().length;
   const mappings = selectedMappings();
-  const current = settings();
-  const perModel = current.cells * current.samples;
-  const total = perModel * (referenceSelected + mappings.length);
-  const referenceEstimate = estimateDuration(referenceSelected, current);
-  const mappingEstimate = estimateDuration(mappings.length, current);
+  const referenceSettings = settings();
+  const mappingProfiles = relayProfiles.mappingProfileSummary(mappings);
+  const mappingSettings = settings(
+    mappingProfiles.profileId || relayProfiles.LEGACY_PROFILE_ID,
+  );
+  const referenceRequests = relayProfiles.requestCount(
+    referenceSettings.methodProfileId,
+    referenceSelected,
+    referenceSettings,
+  );
+  const mappingRequests = mappingProfiles.compatible
+    ? relayProfiles.requestCount(
+      mappingSettings.methodProfileId,
+      mappings.length,
+      mappingSettings,
+    )
+    : 0;
+  const total = referenceRequests + mappingRequests;
+  const referenceEstimate = estimateDuration(referenceSelected, referenceSettings);
+  const mappingEstimate = estimateDuration(mappings.length, mappingSettings);
   elements.referenceModelCount.textContent = `${referenceSelected} 个已选 / ${state.referenceModels.size} 个候选`;
-  const autoConcurrency = current.concurrencyMode === "auto";
+  const autoConcurrency = referenceSettings.concurrencyMode === "auto";
+  const selectedProfile = relayProfiles.profile(referenceSettings.methodProfileId);
+  elements.preset.disabled = state.running || selectedProfile.paperFaithful;
+  elements.methodProfileNote.textContent = selectedProfile.description
+    + (selectedProfile.paperFaithful
+      ? " 固定 40×30；没有本地 validated policy 时只输出统计距离。"
+      : " 采样规模由下方规格控制，不能作为论文复现或身份定案。");
   elements.concurrency.disabled = state.running;
   elements.concurrencyNote.textContent = autoConcurrency
-    ? "自动模式会按每个中转站的历史稳定性选择并发；连续无进度上限只在长期没有新响应时中断，不限制任务总时长。"
-    : `所有任务固定使用并发 ${current.concurrency}；连续无进度上限只在长期没有新响应时中断，不限制任务总时长。`;
-  elements.requestEstimate.textContent = `${total.toLocaleString("zh-CN")} 次（参考 ${referenceSelected} + 对比 ${mappings.length} 个模型${autoConcurrency ? "；自动并发不额外增加采样量" : ""}）`;
+    ? "参考采集首个模型从不高于 2 的保守并发开始，后续按本批前一模型的错误与重试升降；中转站对比则按同端点与模型的历史稳定性选择。连续无进度上限不限制任务总时长。"
+    : `所有任务固定使用并发 ${referenceSettings.concurrency}；连续无进度上限只在长期没有新响应时中断，不限制任务总时长。`;
+  elements.requestEstimate.textContent = `${total.toLocaleString("zh-CN")} 次（参考 ${referenceRequests.toLocaleString("zh-CN")} + 对比 ${mappingRequests.toLocaleString("zh-CN")}${autoConcurrency ? "；自动并发不增加采样量" : ""}）`;
   elements.timeEstimate.textContent = durationRangeText(referenceEstimate);
   elements.timeEstimateNote.textContent = autoConcurrency
-    ? "自动并发校准前按并发 1 保守估算；选定稳定并发后会更新。"
+    ? "参考首项按不高于 2 的并发保守估算并在本批后续模型自适应；对比任务优先采用同端点与模型的历史并发。"
     : referenceEstimate.historical
       ? "根据本机已完成采样的实际速度估算；网络拥堵、限流与重试会造成波动。"
       : "首次按单请求 1.2–4 秒粗估；完成模型后会用实际速度更新剩余时间。";
-  elements.mappingSummary.textContent = mappings.length
-    ? `已选择 ${mappings.length} 组模型映射，预计产生 ${mappings.length} 份独立比较证据。`
-    : "读取模型后，系统会优先按相同模型 ID 自动匹配参考指纹。";
+  elements.mappingSummary.textContent = state.comparisonRecoveryError || (!mappingProfiles.compatible
+    ? mappingProfiles.message
+    : mappings.length
+      ? `已选择 ${mappings.length} 组模型映射 · ${mappingProfiles.message} · 预计产生 ${mappings.length} 份独立比较证据。`
+      : "读取模型后，系统会优先按相同模型 ID 自动匹配参考指纹。");
   elements.mappingTimeEstimate.textContent = mappings.length
-    ? `${durationRangeText(mappingEstimate)}${autoConcurrency ? "（校准前保守估算）" : mappingEstimate.historical ? "（按本机历史速度）" : "（首次网络粗估）"}`
+    ? `${durationRangeText(mappingEstimate)}${autoConcurrency ? "（按中转站历史；无历史从并发 ≤2 开始）" : mappingEstimate.historical ? "（按本机历史速度）" : "（首次网络粗估）"}`
     : "预计耗时将在选择模型后显示。";
-  elements.runAll.disabled = state.running || mappings.length === 0;
-  elements.referenceForm.querySelector("button[type='submit']").disabled = state.running || referenceSelected === 0;
+  elements.mappingSummary.classList.toggle(
+    "error-text",
+    Boolean(state.comparisonRecoveryError) || !mappingProfiles.compatible,
+  );
+  elements.runAll.disabled = !state.ready || state.running || state.comparisonRecoveryBlocked
+    || mappings.length === 0 || !mappingProfiles.compatible;
+  elements.referenceForm.querySelector("button[type='submit']").disabled = !state.ready
+    || state.running || state.referenceRecoveryBlocked || referenceSelected === 0;
   document.querySelectorAll(".mapping-reference").forEach((select) => {
     select.disabled = state.running || state.references.length === 0;
   });
@@ -1076,6 +1407,7 @@ function liveResultContext(mapping, batchId) {
     referenceName: mapping.reference.name,
     referenceModel: mapping.reference.model,
     referenceArtifactId: mapping.reference.artifactId,
+    methodProfileId: mapping.reference.methodProfileId,
   };
 }
 
@@ -1190,6 +1522,16 @@ function renderResult(context, response) {
   const result = response.result || {};
   const comparison = result.comparison || {};
   const target = result.target || {};
+  const targetFingerprint = target.fingerprint || target;
+  const targetCollection = target.collection || result.collection || {};
+  const protocol = targetFingerprint.protocol
+    || result.protocol
+    || result.method_profile_id
+    || context.methodProfileId
+    || "one-token/v1";
+  const methodProfileId = protocol === relayProfiles.PAPER_PROFILE_ID
+    ? relayProfiles.PAPER_PROFILE_ID
+    : relayProfiles.normalizeProfileId(result.method_profile_id || context.methodProfileId);
   const partial = relayStatus.partialEvidenceInfo({
     ...context,
     status: response.status || context.status,
@@ -1256,11 +1598,21 @@ function renderResult(context, response) {
   const metrics = document.createElement("div");
   metrics.className = "result-metrics";
   metrics.append(
+    resultMetric("指纹方法", relayProfiles.profile(methodProfileId).shortLabel),
     resultMetric("可比较探针", String(comparison.comparableCellCount ?? "—")),
-    resultMetric("内部 JSD", formatNumber(target.splitHalfJsd)),
-    resultMetric("错误请求", String(target.errorCount ?? "—")),
-    resultMetric("任务耗时", formatDuration(target.durationMs)),
-    resultMetric("推理适配", adapterText(target.adapter)),
+    resultMetric(
+      "内部 JSD",
+      formatNumber(target.splitHalfJsd ?? targetCollection.splitHalfMeanJsd),
+    ),
+    resultMetric(
+      "错误请求",
+      String(target.errorCount ?? targetCollection.errorSamples ?? targetFingerprint.errorCount ?? "—"),
+    ),
+    resultMetric("任务耗时", formatDuration(target.durationMs ?? result.durationMs)),
+    resultMetric(
+      "直接采样",
+      targetCollection.directness || targetFingerprint.quality?.directness || adapterText(target.adapter),
+    ),
     resultMetric("实际并发", effectiveConcurrency === null ? "—" : String(effectiveConcurrency)),
     resultMetric("证据 SHA", (response.artifact_sha256 || "—").slice(0, 10)),
   );
@@ -1339,6 +1691,16 @@ function renderResult(context, response) {
       ? "下载目标指纹 JSON"
       : "下载比较证据 JSON";
   evidenceBar.append(artifact, download);
+  const rawEvidenceSha = targetFingerprint.quality?.rawEvidenceSha256
+    || targetCollection.rawEvidenceSha256
+    || result.rawEvidenceSha256;
+  if (rawEvidenceSha && response.artifact_id) {
+    const rawDownload = document.createElement("a");
+    rawDownload.className = "evidence-link";
+    rawDownload.href = `/api/v1/console/evidence/${response.artifact_id}/samples`;
+    rawDownload.textContent = "下载原始 JSONL";
+    evidenceBar.append(rawDownload);
+  }
   details.append(evidenceBar);
 
   const warnings = [...new Set([
@@ -1364,6 +1726,7 @@ function renderResult(context, response) {
 async function loadLatestResults() {
   try {
     const body = await requestJson("/api/v1/console/comparisons/latest");
+    elements.emptyResults.classList.remove("error-text");
     let rendered = 0;
     (body.items || []).forEach((item) => {
       if (!item.response) return;
@@ -1377,6 +1740,7 @@ async function loadLatestResults() {
           referenceName: item.reference_name,
           referenceModel: item.reference_model || "未知参考模型",
           referenceArtifactId: item.reference_artifact_id,
+          methodProfileId: item.method_profile_id,
           status: item.status,
           partial_evidence: item.partial_evidence,
           partial_sample_count: item.partial_sample_count,
@@ -1388,8 +1752,15 @@ async function loadLatestResults() {
       rendered += 1;
     });
     if (rendered && elements.resultsTitle) elements.resultsTitle.textContent = "最近一次对比结果";
-  } catch {
-    // 历史结果恢复失败不应阻塞新的对比。
+    return true;
+  } catch (error) {
+    elements.emptyResults.classList.remove("hidden");
+    elements.emptyResults.classList.add("error-text");
+    const title = elements.emptyResults.querySelector("strong");
+    const detail = elements.emptyResults.querySelector("p");
+    if (title) title.textContent = "最近结果恢复失败";
+    if (detail) detail.textContent = error instanceof Error ? error.message : String(error);
+    return false;
   }
 }
 
@@ -1594,6 +1965,11 @@ function renderActiveBatch(body) {
   }
   state.activeBatchId = batch.id;
   state.activeBatchStatus = batch.status;
+  state.comparisonRecoveryError = "";
+  state.comparisonRecoveryBlocked = false;
+  elements.retryComparisonRecovery.classList.add("hidden");
+  elements.retryComparisonRecovery.disabled = false;
+  elements.mappingSummary.classList.remove("error-text");
   const items = body.items || [];
   const counts = relayStatus.batchStateCounts(items);
   elements.activeBatchPanel.classList.remove("hidden", "is-paused", "is-complete", "is-canceled", "is-mixed");
@@ -1626,6 +2002,7 @@ function renderActiveBatch(body) {
           referenceName: item.reference_name,
           referenceModel: item.reference_model || "未知参考模型",
           referenceArtifactId: item.reference_artifact_id,
+          methodProfileId: item.method_profile_id,
           status: item.status,
           partial_evidence: item.partial_evidence,
           partial_sample_count: item.partial_sample_count,
@@ -1653,7 +2030,7 @@ function renderActiveBatch(body) {
     || counts.waiting > 0;
   const pauseable = ["running", "pausing", "paused"].includes(batch.status);
   const cancelable = ["running", "pausing", "paused"].includes(batch.status);
-  setBusy(polling);
+  setBusy(polling, "comparison");
   elements.pauseBatch.classList.toggle("hidden", !pauseable);
   elements.cancelBatch.classList.toggle("hidden", !cancelable);
   elements.cancelBatch.disabled = !cancelable;
@@ -1688,31 +2065,79 @@ async function pollActiveBatch() {
 }
 
 async function loadActiveBatch() {
+  state.comparisonRecoveryBlocked = true;
+  elements.retryComparisonRecovery.disabled = true;
+  updateControls();
   try {
     const body = await requestJson("/api/v1/console/comparison-batches/active");
     if (body.batch) {
       renderActiveBatch(body);
       scheduleBatchPoll();
-      return;
+      return true;
     }
-    const latest = await requestJson("/api/v1/console/comparisons/latest");
-    const latestItems = latest.items || [];
-    const latestBatch = latestItems.find((item) => item.batch)?.batch;
-    if (latestBatch) renderActiveBatch({ batch: latestBatch, items: latestItems });
-  } catch {
-    // 活跃任务恢复失败不阻塞工作台配置恢复。
+    state.comparisonRecoveryBlocked = false;
+    state.comparisonRecoveryError = "";
+    elements.retryComparisonRecovery.classList.add("hidden");
+    elements.retryComparisonRecovery.disabled = false;
+    elements.activeBatchPanel.classList.add("hidden");
+    setBusy(false, "comparison");
+    return false;
+  } catch (error) {
+    state.comparisonRecoveryBlocked = true;
+    setBusy(false, "comparison");
+    state.comparisonRecoveryError = `无法确认是否已有对比任务：${error instanceof Error ? error.message : String(error)}`;
+    elements.activeBatchPanel.classList.remove("hidden");
+    elements.activeBatchStatus.textContent = `对比任务恢复失败：${error instanceof Error ? error.message : String(error)}`;
+    elements.activeBatchCounts.replaceChildren();
+    elements.retryComparisonRecovery.classList.remove("hidden");
+    elements.retryComparisonRecovery.disabled = false;
+    elements.pauseBatch.classList.add("hidden");
+    elements.cancelBatch.classList.add("hidden");
+    elements.mappingSummary.classList.add("error-text");
+    elements.mappingSummary.textContent = `${state.comparisonRecoveryError}。请检查本地服务状态后再创建新批次。`;
+    return false;
   }
 }
 
+async function recoverComparisonBatch(batchId, message = "已恢复正在执行的对比批次") {
+  const body = await requestJson(`/api/v1/console/comparison-batches/${batchId}`);
+  state.comparisonRecoveryBlocked = false;
+  renderActiveBatch(body);
+  state.comparisonRecoveryError = "";
+  elements.mappingSummary.classList.remove("error-text");
+  elements.mappingSummary.textContent = `${message} · 批次 ${String(batchId).slice(0, 8)}。`;
+  scheduleBatchPoll();
+  return true;
+}
+
+async function retryComparisonRecovery() {
+  elements.retryComparisonRecovery.disabled = true;
+  state.comparisonRecoveryError = "正在重新检查后台对比任务…";
+  updateControls();
+  await loadActiveBatch();
+}
+
 async function runAllMappings() {
-  if (state.running) return;
+  if (!state.ready || state.running || state.comparisonRecoveryBlocked) return;
+  state.comparisonRecoveryError = "";
   const mappings = selectedMappings();
   if (!mappings.length) return;
-  setBusy(true);
+  const mappingProfiles = relayProfiles.mappingProfileSummary(mappings);
+  if (!mappingProfiles.compatible) {
+    elements.mappingSummary.classList.add("error-text");
+    elements.mappingSummary.textContent = mappingProfiles.message;
+    return;
+  }
+  setBusy(true, "comparison");
   elements.results.replaceChildren();
   elements.emptyResults.classList.remove("hidden");
+  elements.emptyResults.classList.remove("error-text");
+  const emptyTitle = elements.emptyResults.querySelector("strong");
+  const emptyDetail = elements.emptyResults.querySelector("p");
+  if (emptyTitle) emptyTitle.textContent = "等待本批次首个结果";
+  if (emptyDetail) emptyDetail.textContent = "任务由本地服务执行；刷新页面后仍会恢复进度和已完成证据。";
   if (elements.resultsTitle) elements.resultsTitle.textContent = "本次对比结果";
-  const current = settings();
+  const current = settings(mappingProfiles.profileId || relayProfiles.LEGACY_PROFILE_ID);
   try {
     const body = await postJson("/api/v1/console/comparison-batches", {
       items: mappings.map((mapping) => ({
@@ -1737,8 +2162,38 @@ async function runAllMappings() {
     renderActiveBatch(body);
     scheduleBatchPoll();
   } catch (error) {
-    setBusy(false);
-    elements.mappingSummary.textContent = `任务创建失败：${error instanceof Error ? error.message : String(error)}`;
+    const existingId = error?.status === 409 ? relayStatus.conflictBatchId(error) : "";
+    if (existingId) {
+      try {
+        await recoverComparisonBatch(existingId, "检测到已有对比批次，已重新关联");
+        return;
+      } catch (recoveryError) {
+        state.comparisonRecoveryBlocked = true;
+        elements.activeBatchPanel.classList.remove("hidden");
+        elements.retryComparisonRecovery.classList.remove("hidden");
+        elements.retryComparisonRecovery.disabled = false;
+        elements.pauseBatch.classList.add("hidden");
+        elements.cancelBatch.classList.add("hidden");
+        elements.activeBatchStatus.textContent = `已有对比批次 ${existingId}，但恢复失败`;
+        elements.activeBatchCounts.replaceChildren();
+        elements.mappingSummary.textContent = `已有对比批次 ${existingId}，但恢复失败：${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`;
+      }
+    } else if (error?.status === 409) {
+      state.comparisonRecoveryBlocked = true;
+      elements.activeBatchPanel.classList.remove("hidden");
+      elements.retryComparisonRecovery.classList.remove("hidden");
+      elements.retryComparisonRecovery.disabled = false;
+      elements.pauseBatch.classList.add("hidden");
+      elements.cancelBatch.classList.add("hidden");
+      elements.activeBatchStatus.textContent = "后端报告已有对比批次，但未返回批次 ID";
+      elements.activeBatchCounts.replaceChildren();
+      elements.mappingSummary.textContent = `对比批次冲突：${error instanceof Error ? error.message : String(error)}。请点击“重试恢复”从活动任务接口重新关联。`;
+    } else {
+      elements.mappingSummary.textContent = `任务创建失败：${error instanceof Error ? error.message : String(error)}`;
+    }
+    elements.mappingSummary.classList.add("error-text");
+    state.comparisonRecoveryError = elements.mappingSummary.textContent;
+    setBusy(false, "comparison");
   }
 }
 
@@ -1821,6 +2276,9 @@ async function checkHealth() {
 }
 
 elements.referenceForm.addEventListener("submit", collectReferences);
+elements.pauseReference.addEventListener("click", pauseOrResumeReferenceCollection);
+elements.cancelReference.addEventListener("click", cancelReferenceCollection);
+elements.retryReferenceRecovery.addEventListener("click", retryReferenceRecovery);
 elements.fetchReferenceModels.addEventListener("click", fetchReferenceModels);
 elements.addReferenceModel.addEventListener("click", () => {
   addReferenceModel(elements.referenceManualModel.value, true);
@@ -1839,6 +2297,7 @@ elements.clearReferenceModels.addEventListener("click", () => {
 elements.refreshReferences.addEventListener("click", loadReferences);
 elements.addTarget.addEventListener("click", () => addTarget());
 elements.runAll.addEventListener("click", runAllMappings);
+elements.retryComparisonRecovery.addEventListener("click", retryComparisonRecovery);
 elements.pauseBatch.addEventListener("click", pauseOrResumeActiveBatch);
 elements.cancelBatch.addEventListener("click", cancelActiveBatch);
 elements.clearKeys.addEventListener("click", () => {
@@ -1847,6 +2306,7 @@ elements.clearKeys.addEventListener("click", () => {
   });
 });
 elements.preset.addEventListener("change", updateControls);
+elements.methodProfile.addEventListener("change", updateControls);
 elements.concurrencyMode.addEventListener("change", updateControls);
 elements.concurrency.addEventListener("change", updateControls);
 elements.requestTimeout.addEventListener("change", updateControls);
@@ -1880,15 +2340,23 @@ elements.resetWorkspace?.addEventListener("click", () => {
 });
 
 async function initializeConsole() {
+  setBusy(true, "initialization");
   restoringWorkspace = true;
   await loadReferences();
   const restored = restoreWorkspace();
   if (!restored) seedDefaultWorkspace();
   restoringWorkspace = false;
+  // restoreWorkspace 会动态创建输入框；再次应用初始化闸门，避免恢复检查完成前重复提交。
+  setBusy(true, "initialization");
   updateControls();
   saveWorkspaceNow();
-  await loadLatestResults();
-  await loadActiveBatch();
+  await Promise.all([
+    loadLatestResults(),
+    loadActiveReferenceCollection(),
+    loadActiveBatch(),
+  ]);
+  state.ready = true;
+  setBusy(false, "initialization");
   checkHealth();
 }
 

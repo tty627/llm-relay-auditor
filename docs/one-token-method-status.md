@@ -15,7 +15,7 @@
 
 ## 论文、旧协议与新协议
 
-| 项目 | 论文 Study A | legacy `one-token/v1` | opt-in V2 论文 profile |
+| 项目 | 论文 Study A | legacy `one-token/v1` | Web 默认 V2 论文 profile |
 |---|---|---|---|
 | tasks × languages | 10 × 4 = 40 cells | 8 × 2 = 16 cells；业务默认只取前 4 个 | 精确 10 × 4 = 40 cells |
 | 语言 | en / ru / zh / ar | en / zh | en / ru / zh / ar |
@@ -39,10 +39,11 @@
 5. 新增作者 40-cell 固定 prompt profile、作者兼容 normalizer、deterministic scheduler、repetition-parity split 和推理污染筛查。
 6. 新增严格 `ThresholdPolicy` 格式、canonical hash、训练/holdout 不重用校验及 inert calibration evidence 存储。策略不会被路由自动发现或启用。
 7. 历史 V1/OpenTech 快照保持只读；它们被标记为非官方 relay snapshot、不可用于 operational identity decision。
+8. Web 参考采集与待测批次已接入同一 V2 profile：参考端固定采集 40×30、保存 canonical JSONL，待测端按参考证据自动选择协议；V1/V2 混合批次会被拒绝。长任务在本机后台执行，支持刷新恢复、暂停、取消和 partial 证据。
 
 ## 仍未完成，不能对外宣称的事项
 
-- 新 V2 collector 复现的是论文的 T=1 Study-A 指纹采集通道，不等于复现论文的整套实验。T=0 determinism、165 模型主实验、ROC/EER 和全部消融尚未在本仓库重跑。
+- Web 默认的 V2 collector 复现的是论文的 T=1 Study-A 指纹采集通道，不等于复现论文的整套实验。T=0 determinism、165 模型主实验、ROC/EER 和全部消融尚未在本仓库重跑。
 - 尚未采集同协议的官方第一方 enrollment reference。
 - 尚未完成“官方自对照、已知替换、独立留出”的真实校准，也没有真实 FAR/FRR 及置信区间。
 - 尚未把任何校准策略接入生产路由；这是有意的安全默认，而不是遗漏一个阈值常量。
