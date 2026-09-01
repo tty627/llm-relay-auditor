@@ -225,6 +225,7 @@ async def test_openai_tool_finish_reason_is_reasoning_contamination() -> None:
         ("body", "SK-PREFLIGHT ECHO CANARY"),
         ("header", "skpreflightechocanary"),
     ],
+    ids=("body-variant", "header-variant"),
 )
 async def test_credential_variants_in_any_response_channel_are_rejected(
     location: str,

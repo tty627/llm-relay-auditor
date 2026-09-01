@@ -1035,6 +1035,7 @@ async def test_invalid_cli_json_credential_echo_fails_closed(
         ),
         ("progress", "sk-Progress-１２３-Key", "skprogress123key"),
     ],
+    ids=("stdout-exact", "stderr-casefold", "stderr-nfd", "progress-legacy-compact"),
 )
 async def test_child_output_channels_abort_on_all_credential_echo_variants(
     tmp_path: Path,
