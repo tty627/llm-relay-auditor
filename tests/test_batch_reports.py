@@ -362,6 +362,7 @@ def test_verified_loader_rejects_digest_mismatch_and_noncanonical_json(tmp_path:
         "sÉcret-１２３-kEY",
         "sécret123key",
     ],
+    ids=("embedded-exact", "nfd", "casefold", "legacy-compact"),
 )
 def test_secret_scanner_detects_exact_nfc_casefold_and_legacy_variants(candidate: str) -> None:
     scanner = SecretCanaryScanner(["SÉCRET-１２３-Key"])
