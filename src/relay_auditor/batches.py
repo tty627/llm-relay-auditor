@@ -483,8 +483,12 @@ class ComparisonBatchManager:
                 runtime.station_retry_at.get(item.request.station_name, 0.0),
             )
             run = self.database.get_run(item.audit_id)
-            if retry_at > now and run is not None and run.status == "queued":
-                retry_times.append(retry_at)
+            if run is not None and run.status == "queued":
+                # The cooldown can expire between _next_item() and this
+                # second clock read. Keep the queued item visible to the
+                # scheduler and retry immediately instead of declaring the
+                # batch complete with unfinished rows.
+                retry_times.append(max(now, retry_at))
         if not retry_times:
             return None
         return max(0.0, min(retry_times) - now)
