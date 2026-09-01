@@ -83,6 +83,37 @@ GET  /api/v1/console/one-model-batches/{id}/report.csv
 
 页面提交成功会立即清空明文 Key 和 TSV 粘贴区；Key、环境变量名及上游错误正文不会进入任务数据库、日志或报告。服务重启会把缺少内存凭据的未完成条目标记为 `interrupted`，不会自动重放请求。
 
+### 真实 Key 启用前的发布门槛
+
+`REAL KEY BATCH READY` 必须绑定到一个具体的 Git commit 和递归检出的子模块版本，不能只依据开发工作树或历史 CI。发布候选至少应从全新目录执行：
+
+```bash
+git clone --recurse-submodules https://github.com/tty627/llm-relay-auditor.git
+cd llm-relay-auditor
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e '.[dev]'
+
+(cd llm-fingerprint-detector && npm ci && npm test)
+pytest
+ruff check .
+node --test tests/web_status.test.js tests/web_profiles.test.js
+
+export AUDITOR_GIT_SHA="$(git rev-parse --verify 'HEAD^{commit}')"
+export AUDITOR_ACCESS_TOKEN="$(openssl rand -hex 32)"
+export AUDITOR_MANAGEMENT_TOKEN="$AUDITOR_ACCESS_TOKEN"
+docker compose config -q
+
+git diff --exit-code
+git status --short
+git submodule status --recursive
+```
+
+在上述常规测试之外，最终安全验收还必须使用至少两把**虚构 canary Key** 并发覆盖完整凭据生命周期，并独立扫描 HTTP 输出、进程日志、JUnit、SQLite、JSON、JSONL、CSV 和浏览器刷新后的可见状态。扫描需同时检查 exact、NFC、casefold、去分隔符和 Unicode 转义等历史规范化变体；网络侧需覆盖 SSRF、DNS rebinding、重定向拒绝、429 隔离与重试预算、取消冷却以及服务重启。任一明文或变体泄漏、越权发送、未验证重定向、失败后自动重放，都必须使 `REAL KEY BATCH READY = NO`。
+
+该门槛只确认上述 commit 的本地批量执行与凭据安全工程条件，不代表参考 API 是官方真值，也不代表模型身份、FAR/FRR 或真实供应商质量已经校准。最终复检结果应在发布记录中单独给出 `OFFICIAL CLEAN CHECKOUT`、精确 commit/submodule SHA、测试计数、扫描范围和 `REAL KEY BATCH READY`；不要把结论硬编码为随 README 变更而失效的长期状态。
+
 ### 旧版多模型工作台
 
 原有工作台继续运行 One Token 行为指纹，作为历史兼容入口：
