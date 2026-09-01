@@ -160,8 +160,14 @@ class FakeFingerprint:
         }
 
 
-async def _wait_ready(database: Database, reference_set_id: str) -> None:
-    for _ in range(200):
+async def _wait_ready(
+    database: Database,
+    reference_set_id: str,
+    *,
+    timeout_seconds: float = 10,
+) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    while asyncio.get_running_loop().time() < deadline:
         reference_set = database.get_reference_set(reference_set_id)
         if reference_set is not None and reference_set.status in {
             "ready",
@@ -170,7 +176,12 @@ async def _wait_ready(database: Database, reference_set_id: str) -> None:
         }:
             return
         await asyncio.sleep(0.01)
-    raise AssertionError("ReferenceSet did not reach a terminal state")
+    reference_set = database.get_reference_set(reference_set_id)
+    last_status = reference_set.status if reference_set is not None else "missing"
+    raise AssertionError(
+        "ReferenceSet did not reach a terminal state "
+        f"within {timeout_seconds:g}s; last status: {last_status}"
+    )
 
 
 async def test_reference_set_manager_collects_three_members_and_seals_hashes(
