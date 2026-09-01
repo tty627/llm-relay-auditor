@@ -19,9 +19,17 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import IntegrityError
 
 from relay_auditor import __version__
+from relay_auditor.batch_reports import (
+    BatchReportIntegrityError,
+    SecretCanaryDetected,
+    SecretCanaryScanner,
+    csv_bytes_from_verified_report,
+    load_verified_batch_report,
+)
 from relay_auditor.batches import ComparisonBatchManager
 from relay_auditor.config import Settings
-from relay_auditor.database import Database
+from relay_auditor.credentials import CredentialSource, RuntimeCredentialStore
+from relay_auditor.database import ActiveBatchConflict, Database
 from relay_auditor.detectors.fingerprint import (
     FingerprintRunner,
     safeguard_verification_result,
@@ -34,14 +42,26 @@ from relay_auditor.detectors.tokenizer import (
     compare_tokenizer_fingerprints,
 )
 from relay_auditor.evidence import EvidenceIntegrityError, EvidenceStore
+from relay_auditor.execution_utils import safe_failure_code
 from relay_auditor.mock_api import router as mock_router
+from relay_auditor.network_safety import canonical_endpoint_url
+from relay_auditor.one_model_batches import OneModelBatchManager, ResolvedCredential
+from relay_auditor.one_model_schemas import OneModelBatchCreateRequest
+from relay_auditor.reference_batches import ReferenceCollectionManager
+from relay_auditor.reference_set_batches import (
+    ReferenceSetManager,
+    load_verified_reference_bundle,
+)
 from relay_auditor.schemas import (
+    LEGACY_ONE_TOKEN_PROFILE,
+    PAPER_ONE_TOKEN_PROFILE,
     AuditResponse,
     BaselineCreateRequest,
     ConsoleComparisonBatchRequest,
     ConsoleFingerprintCollectRequest,
     ConsoleFingerprintVerifyRequest,
     ConsoleModelDiscoveryRequest,
+    ConsoleReferenceCollectionRequest,
     ConsoleReferenceCollectRequest,
     ConsoleReferenceCollectResponse,
     EndpointSpec,
@@ -49,6 +69,7 @@ from relay_auditor.schemas import (
     FingerprintCollectRequest,
     FingerprintVerifyRequest,
     ManagedEndpointCreateRequest,
+    ReferenceSetCreateRequest,
     SmokeAuditRequest,
     TokenizerCollectRequest,
     TokenizerVerifyRequest,
@@ -58,20 +79,49 @@ from relay_auditor.schemas import (
 def create_app(settings: Settings | None = None) -> FastAPI:
     configured = settings or Settings()
     configured.validate_managed_credential_configuration()
+    resolved_git_sha = configured.resolved_git_sha()
     database = Database(configured.database_url)
     evidence = EvidenceStore(configured.evidence_dir)
-    fingerprint = FingerprintRunner(configured.fingerprint_cli_path)
+    fingerprint = FingerprintRunner(
+        configured.fingerprint_cli_path,
+        allow_insecure_loopback_for_tests=configured.allow_test_loopback_endpoints,
+    )
     batches = ComparisonBatchManager(database, evidence, fingerprint)
+    reference_batches = ReferenceCollectionManager(database, evidence, fingerprint)
+    runtime_credentials = RuntimeCredentialStore()
+    reference_sets = ReferenceSetManager(
+        database,
+        evidence,
+        fingerprint,
+        runtime_credentials,
+        allow_test_loopback=configured.allow_test_loopback_endpoints,
+    )
+    one_model_batches = OneModelBatchManager(
+        database,
+        evidence,
+        fingerprint,
+        runtime_credentials,
+        allow_test_loopback=configured.allow_test_loopback_endpoints,
+        git_sha=resolved_git_sha,
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         database.initialize()
-        database.interrupt_orphaned_comparison_batches()
         evidence.initialize()
+        database.interrupt_orphaned_comparison_batches()
+        database.interrupt_orphaned_reference_collections()
+        database.interrupt_orphaned_reference_sets()
+        database.interrupt_orphaned_one_model_batches()
+        await one_model_batches.recover_interrupted_reports()
         try:
             yield
         finally:
+            await one_model_batches.shutdown()
+            await reference_sets.shutdown()
+            await reference_batches.shutdown()
             await batches.shutdown()
+            runtime_credentials.clear()
 
     app = FastAPI(
         title=configured.app_name,
@@ -80,10 +130,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.settings = configured
+    app.state.git_sha = resolved_git_sha
     app.state.database = database
     app.state.evidence = evidence
     app.state.fingerprint = fingerprint
     app.state.batches = batches
+    app.state.reference_batches = reference_batches
+    app.state.runtime_credentials = runtime_credentials
+    app.state.reference_sets = reference_sets
+    app.state.one_model_batches = one_model_batches
     app.include_router(mock_router)
     management_token_header = APIKeyHeader(
         name="X-Relay-Auditor-Token",
@@ -297,6 +352,142 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except (ValueError, RuntimeError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
+    def resolve_runtime_credential(
+        credential: Any,
+        *,
+        request: Request,
+        presented_management_token: str | None,
+        base_url: str,
+        model: str,
+        protocol: str,
+    ) -> ResolvedCredential:
+        """Resolve a credential without persisting or reflecting its source name."""
+
+        if credential.mode == "ephemeral":
+            secret = credential.reveal_api_key().strip()
+            source: CredentialSource = "ephemeral"
+        else:
+            require_managed_credential_access(request, presented_management_token)
+            try:
+                configured.require_api_key_base_url_binding(credential.name, base_url)
+                canonical_base_url = canonical_endpoint_url(base_url, protocol)[0]
+                bound = any(
+                    managed.enabled
+                    and managed.api_key_env == credential.name
+                    and managed.protocol == protocol
+                    and managed.model == model
+                    and canonical_endpoint_url(managed.base_url, protocol)[0]
+                    == canonical_base_url
+                    for managed in database.list_endpoints()
+                )
+                if not bound:
+                    raise ValueError("environment credential binding mismatch")
+                secret = configured.resolve_api_key(credential.name) or ""
+            except (ValueError, RuntimeError) as error:
+                raise HTTPException(
+                    status_code=400,
+                    detail="environment credential is unavailable or not bound to this endpoint",
+                ) from error
+            source = "env_ref"
+        if not secret:
+            raise HTTPException(status_code=400, detail="credential must not be empty")
+        return ResolvedCredential(secret=secret, source=source)
+
+    def safe_start_error(error: Exception, secrets_to_check: list[str]) -> str:
+        """Return useful control-plane errors, but never a transformed credential echo."""
+
+        try:
+            SecretCanaryScanner(secrets_to_check).reject(str(error))
+        except SecretCanaryDetected:
+            return "request rejected by credential safety policy"
+        return str(error)
+
+    def reference_set_payload(reference_set_id: str) -> dict[str, Any]:
+        reference_set = database.get_reference_set(reference_set_id)
+        if reference_set is None:
+            raise LookupError(f"ReferenceSet not found: {reference_set_id}")
+        rows = database.get_reference_set_rows(reference_set_id)
+        item = reference_set.as_dict()
+        created_at = reference_set.created_at
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=UTC)
+        item["age_seconds"] = max(
+            0,
+            round((datetime.now(UTC) - created_at.astimezone(UTC)).total_seconds()),
+        )
+        item["members"] = [
+            {
+                key: value
+                for key, value in member.as_dict().items()
+                if key != "artifact_path"
+            }
+            for _, member in rows
+        ]
+        item["selectable"] = False
+        item["evidence_integrity"] = "not_ready"
+        if reference_set.status == "ready":
+            try:
+                load_verified_reference_bundle(database, evidence, reference_set_id)
+            except FileNotFoundError:
+                item["evidence_integrity"] = "missing"
+            except (EvidenceIntegrityError, ValueError, OSError):
+                item["evidence_integrity"] = "corrupt"
+            else:
+                item["selectable"] = True
+                item["evidence_integrity"] = "verified"
+        return item
+
+    def one_model_batch_payload(batch_id: str) -> dict[str, Any]:
+        batch = database.get_one_model_batch(batch_id)
+        if batch is None:
+            raise LookupError(f"one-model batch not found: {batch_id}")
+        public_batch = {
+            key: value
+            for key, value in batch.as_dict().items()
+            if key != "report_path"
+        }
+        public_batch["report_available"] = False
+        public_batch["report_integrity"] = "none"
+        if batch.report_path and batch.report_sha256:
+            try:
+                evidence.verify_registered_path(
+                    batch.report_path,
+                    batch.report_sha256,
+                    expected_path=evidence.batch_report_path(batch_id),
+                )
+            except FileNotFoundError:
+                public_batch["report_integrity"] = "missing"
+            except (EvidenceIntegrityError, OSError):
+                public_batch["report_integrity"] = "corrupt"
+            else:
+                public_batch["report_available"] = True
+                public_batch["report_integrity"] = "verified"
+
+        items: list[dict[str, Any]] = []
+        for stored in database.list_one_model_batch_items(batch_id):
+            public_item = {
+                key: value
+                for key, value in stored.as_dict().items()
+                if key != "comparison_json_path"
+            }
+            public_item["result"] = None
+            public_item["evidence_integrity"] = "none"
+            if stored.comparison_json_path and stored.comparison_json_sha256:
+                try:
+                    public_item["result"] = evidence.read_verified_json(
+                        stored.comparison_json_path,
+                        stored.comparison_json_sha256,
+                        expected_path=evidence.target_comparison_path(stored.id),
+                    )
+                except FileNotFoundError:
+                    public_item["evidence_integrity"] = "missing"
+                except (EvidenceIntegrityError, OSError, ValueError):
+                    public_item["evidence_integrity"] = "corrupt"
+                else:
+                    public_item["evidence_integrity"] = "verified"
+            items.append(public_item)
+        return {"batch": public_batch, "items": items}
+
     def verified_reference_path(
         artifact_id: str,
         *,
@@ -398,6 +589,122 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             }
         )
         return item
+    async def collect_one_token_profile(
+        endpoint: Any,
+        *,
+        audit_id: str,
+        method_profile_id: str,
+        samples: int,
+        cells: int,
+        concurrency: int,
+        api_key: str | None = None,
+        role: str = "enrollment",
+    ) -> dict[str, Any]:
+        output_path = evidence.fingerprint_path(audit_id)
+        if method_profile_id == PAPER_ONE_TOKEN_PROFILE:
+            result = await fingerprint.collect_paper_profile(
+                endpoint,
+                role=role,
+                scheduler_seed=f"relay-auditor:{role}:{audit_id}",
+                output_path=output_path,
+                samples_output_path=evidence.fingerprint_samples_path(audit_id),
+                samples=samples,
+                concurrency=concurrency,
+                timeout=max(100, round(configured.request_timeout_seconds * 1000)),
+                api_key=api_key,
+            )
+            return {**result, "methodProfileId": method_profile_id}
+        if method_profile_id != LEGACY_ONE_TOKEN_PROFILE:
+            raise ValueError(f"unsupported One Token method profile: {method_profile_id}")
+        result = await fingerprint.collect(
+            endpoint,
+            output_path=output_path,
+            cells=cells,
+            samples=samples,
+            concurrency=concurrency,
+            api_key=api_key,
+        )
+        return {**result, "methodProfileId": method_profile_id}
+
+    async def verify_one_token_profile(
+        endpoint: Any,
+        *,
+        audit_id: str,
+        reference_artifact_id: str,
+        cells: int,
+        samples: int,
+        concurrency: int,
+        api_key: str | None = None,
+        expected_method_profile_id: str | None = None,
+    ) -> tuple[str, dict[str, Any], str]:
+        reference_path = verified_reference_path(
+            reference_artifact_id,
+            category="fingerprints",
+            detector="one_token_collect",
+        )
+        reference_metadata = database.get_reference_metadata(reference_artifact_id)
+        method_profile_id = evidence.fingerprint_method_profile(
+            reference_artifact_id,
+            metadata=reference_metadata,
+        )
+        if (
+            expected_method_profile_id is not None
+            and expected_method_profile_id != method_profile_id
+        ):
+            raise ValueError("requested method_profile_id does not match the reference artifact")
+        target_path = evidence.fingerprint_path(audit_id)
+        if method_profile_id == PAPER_ONE_TOKEN_PROFILE:
+            collected = await collect_one_token_profile(
+                endpoint,
+                audit_id=audit_id,
+                method_profile_id=method_profile_id,
+                samples=samples,
+                cells=40,
+                concurrency=concurrency,
+                api_key=api_key,
+                role="audit",
+            )
+            comparison = await fingerprint.compare_paper_fingerprints(
+                enrollment_path=reference_path,
+                audit_path=target_path,
+            )
+            raw_verdict = str(comparison.get("verdict") or "insufficient")
+            raw_result = {
+                "verdict": raw_verdict,
+                "meanJsd": comparison.get("meanJsd"),
+                "comparison": comparison,
+                "target": {
+                    "fingerprint": collected["fingerprint"],
+                    "collection": collected["collection"],
+                },
+                "reference": evidence.read_json(reference_path),
+                "methodProfileId": method_profile_id,
+                "interpretation": "uncalibrated-non-decision-evidence",
+                "decisionEligible": False,
+                "targetSamplesArtifactId": audit_id,
+                "targetRawEvidenceSha256": collected["collection"].get("rawEvidenceSha256"),
+                "warnings": [
+                    "Paper-profile distance is exploratory until a validated local "
+                    "threshold policy is supplied."
+                ],
+            }
+        else:
+            raw_verdict, raw_result = await fingerprint.verify(
+                endpoint,
+                reference_path=reference_path,
+                output_path=target_path,
+                cells=cells,
+                samples=samples,
+                concurrency=concurrency,
+                api_key=api_key,
+            )
+            raw_result = {**raw_result, "methodProfileId": method_profile_id}
+        verdict, result = safeguard_verification_result(
+            raw_verdict,
+            raw_result,
+            reference_metadata=reference_metadata,
+        )
+        return verdict, result, method_profile_id
 
     @app.get("/", include_in_schema=False)
     async def console() -> FileResponse:
@@ -436,7 +743,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 endpoint_id=str(uuid4()),
                 name=payload.name,
                 provider=payload.provider,
-                base_url=normalize_fingerprint_base_url(str(payload.base_url)),
+                base_url=canonical_endpoint_url(str(payload.base_url), payload.protocol)[0],
                 model=payload.model,
                 protocol=payload.protocol,
                 api_key_env=payload.api_key_env,
@@ -607,9 +914,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         output_path = evidence.fingerprint_path(audit_id)
         try:
-            result = await fingerprint.collect(
+            result = await collect_one_token_profile(
                 payload.endpoint,
-                output_path=output_path,
+                audit_id=audit_id,
+                method_profile_id=payload.method_profile_id,
                 cells=payload.cells,
                 samples=payload.samples,
                 concurrency=payload.concurrency,
@@ -658,26 +966,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             model=payload.endpoint.model,
         )
         try:
-            reference_path = verified_reference_path(
-                payload.reference_artifact_id,
-                category="fingerprints",
-                detector="one_token_collect",
-            )
-            reference_metadata = database.get_reference_metadata(payload.reference_artifact_id)
             target_path = evidence.fingerprint_path(audit_id)
-            verdict, result = await fingerprint.verify(
+            verdict, result, method_profile_id = await verify_one_token_profile(
                 payload.endpoint,
-                reference_path=reference_path,
-                output_path=target_path,
+                audit_id=audit_id,
+                reference_artifact_id=payload.reference_artifact_id,
                 cells=payload.cells,
                 samples=payload.samples,
                 concurrency=payload.concurrency,
                 api_key=api_key,
-            )
-            verdict, result = safeguard_verification_result(
-                verdict,
-                result,
-                reference_metadata=reference_metadata,
+                expected_method_profile_id=(
+                    payload.method_profile_id
+                    if "method_profile_id" in payload.model_fields_set
+                    else None
+                ),
             )
             artifact = evidence.write_json("verification", audit_id, result)
             database.finish_run(
@@ -731,10 +1033,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=502, detail=detail) from error
 
     def redact_error(error: Exception, api_key: str | None) -> str:
-        detail = str(error)
         if api_key:
-            detail = detail.replace(api_key, "[REDACTED]")
-        return detail
+            try:
+                SecretCanaryScanner([api_key]).reject(str(error))
+            except SecretCanaryDetected:
+                return "credential_echo_detected"
+        if isinstance(error, FileNotFoundError):
+            return "evidence_not_found"
+        if isinstance(error, EvidenceIntegrityError):
+            return "evidence_integrity_failed"
+        code, _ = safe_failure_code(error)
+        return code
 
     def comparison_item(
         row: tuple[Any, Any, Any],
@@ -815,7 +1124,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "decisionEligible": False,
             }
         preflight = execution.get("preflight") if isinstance(execution, dict) else None
+        method_profile_id = result.get("methodProfileId") if result else None
+        if method_profile_id is None and isinstance(execution, dict):
+            method_profile_id = execution.get("methodProfileId")
+        if method_profile_id is None and record is not None:
+            try:
+                method_profile_id = evidence.fingerprint_method_profile(
+                    record.reference_artifact_id,
+                    metadata=database.get_reference_metadata(record.reference_artifact_id),
+                )
+            except (FileNotFoundError, ValueError):
+                method_profile_id = LEGACY_ONE_TOKEN_PROFILE
+        target_collection = target.get("collection") if isinstance(target, dict) else None
         partial_evidence = bool(result and result.get("partial") is True)
+        primary_quality = result.get("quality") if result else None
+        raw_evidence_sha256 = (
+            primary_quality.get("rawEvidenceSha256") if isinstance(primary_quality, dict) else None
+        )
+        if raw_evidence_sha256 is None and result is not None:
+            raw_evidence_sha256 = result.get("targetRawEvidenceSha256")
+        if raw_evidence_sha256 is None and isinstance(target_collection, dict):
+            raw_evidence_sha256 = target_collection.get("rawEvidenceSha256")
+        samples_evidence_available = bool(
+            isinstance(raw_evidence_sha256, str)
+            and raw_evidence_sha256
+            and evidence.fingerprint_samples_path(run.id).is_file()
+        )
         if artifact_integrity == "corrupt":
             evidence_state = "corrupt"
         elif result is None:
@@ -850,6 +1184,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "reference_artifact_id": record.reference_artifact_id if record else None,
             "reference_name": record.reference_name if record else "历史参考端",
             "reference_model": record.reference_model if record else reference.get("model"),
+            "method_profile_id": method_profile_id or LEGACY_ONE_TOKEN_PROFILE,
             "status": run.status,
             "verdict": operational_verdict,
             "decision": decision,
@@ -861,7 +1196,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "verdict_semantics": verdict_semantics,
             "mean_jsd": raw_mean_jsd,
             "comparable_cell_count": comparison.get("comparableCellCount"),
-            "error_count": target.get("errorCount"),
+            "error_count": (
+                target_collection.get("errorSamples")
+                if isinstance(target_collection, dict)
+                else target.get("errorCount")
+            ),
             "duration_ms": target.get("durationMs", elapsed),
             "started_at": run.as_dict()["started_at"],
             "completed_at": run.as_dict()["completed_at"],
@@ -880,6 +1219,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "partial_error_count": (
                 result.get("errorCount") if partial_evidence and result else None
             ),
+            "samples_evidence_available": samples_evidence_available,
+            "raw_evidence_sha256": raw_evidence_sha256,
             "preflight": preflight if isinstance(preflight, dict) else None,
             "error_message": run.error_message,
             "progress": progress.as_dict() if progress else None,
@@ -942,11 +1283,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "interrupted",
         }
         if requested_verdict and requested_verdict not in lifecycle_statuses:
-            items = [
-                item
-                for item in items
-                if item.get("operational_verdict") == requested_verdict
-            ]
+            items = [item for item in items if item.get("operational_verdict") == requested_verdict]
             total = len(items)
             items = items[safe_offset : safe_offset + safe_limit]
         return {
@@ -1010,6 +1347,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             batch_id = batches.start(payload)
         except FileNotFoundError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
+        except ActiveBatchConflict as error:
+            raise HTTPException(
+                status_code=409,
+                detail={"message": str(error), "batch_id": error.batch_id},
+            ) from error
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         return comparison_batch_payload(batch_id)
@@ -1100,6 +1442,342 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             detail = redact_error(error, api_key)
             raise HTTPException(status_code=502, detail=detail) from error
 
+    @app.post("/api/v1/console/reference-sets", status_code=202)
+    async def console_create_reference_set(
+        payload: ReferenceSetCreateRequest,
+        request: Request,
+        response: Response,
+        management_token: Annotated[str | None, Security(management_token_header)],
+    ) -> dict[str, Any]:
+        response.headers["Cache-Control"] = "no-store"
+        resolved = resolve_runtime_credential(
+            payload.credential,
+            request=request,
+            presented_management_token=management_token,
+            base_url=str(payload.base_url),
+            model=payload.actual_model,
+            protocol=payload.protocol,
+        )
+        try:
+            reference_set_id = await reference_sets.start(
+                payload,
+                credential_secret=resolved.secret,
+                credential_source=resolved.source,
+            )
+        except (ValueError, RuntimeError, OSError) as error:
+            detail = safe_start_error(error, [resolved.secret])
+            raise HTTPException(status_code=400, detail=detail) from error
+        return reference_set_payload(reference_set_id)
+
+    @app.get("/api/v1/console/reference-sets")
+    async def console_list_reference_sets(
+        ready_only: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "items": [
+                reference_set_payload(item.id)
+                for item in database.list_reference_sets(ready_only=ready_only)
+            ]
+        }
+
+    @app.get("/api/v1/console/reference-sets/{reference_set_id}")
+    async def console_get_reference_set(reference_set_id: str) -> dict[str, Any]:
+        try:
+            return reference_set_payload(reference_set_id)
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.post("/api/v1/console/reference-sets/{reference_set_id}/pause")
+    async def console_pause_reference_set(reference_set_id: str) -> dict[str, Any]:
+        try:
+            await reference_sets.pause(reference_set_id)
+            return reference_set_payload(reference_set_id)
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/api/v1/console/reference-sets/{reference_set_id}/resume")
+    async def console_resume_reference_set(reference_set_id: str) -> dict[str, Any]:
+        try:
+            await reference_sets.resume(reference_set_id)
+            return reference_set_payload(reference_set_id)
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/api/v1/console/reference-sets/{reference_set_id}/cancel")
+    async def console_cancel_reference_set(reference_set_id: str) -> dict[str, Any]:
+        try:
+            await reference_sets.cancel(reference_set_id)
+            return reference_set_payload(reference_set_id)
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/api/v1/console/one-model-batches", status_code=202)
+    async def console_create_one_model_batch(
+        payload: OneModelBatchCreateRequest,
+        request: Request,
+        response: Response,
+        management_token: Annotated[str | None, Security(management_token_header)],
+    ) -> dict[str, Any]:
+        response.headers["Cache-Control"] = "no-store"
+        reference_set = database.get_reference_set(payload.reference_set_id)
+        if reference_set is None:
+            raise HTTPException(status_code=404, detail="ReferenceSet not found")
+        if reference_set.status != "ready":
+            raise HTTPException(status_code=409, detail="ReferenceSet is not ready")
+        resolved: dict[str, ResolvedCredential] = {}
+        for target in payload.targets:
+            resolved[target.row_id] = resolve_runtime_credential(
+                target.credential,
+                request=request,
+                presented_management_token=management_token,
+                base_url=str(target.base_url),
+                model=(target.model_id or payload.default_model_id).strip(),
+                protocol=reference_set.protocol,
+            )
+        secrets_to_check = [credential.secret for credential in resolved.values()]
+        try:
+            batch_id = await one_model_batches.start(
+                payload,
+                resolved_credentials=resolved,
+            )
+        except LookupError as error:
+            detail = safe_start_error(error, secrets_to_check)
+            raise HTTPException(status_code=404, detail=detail) from error
+        except (EvidenceIntegrityError, BatchReportIntegrityError) as error:
+            detail = safe_start_error(error, secrets_to_check)
+            raise HTTPException(status_code=409, detail=detail) from error
+        except (ValueError, RuntimeError, OSError) as error:
+            detail = safe_start_error(error, secrets_to_check)
+            raise HTTPException(status_code=400, detail=detail) from error
+        return one_model_batch_payload(batch_id)
+
+    @app.get("/api/v1/console/one-model-batches/{batch_id}")
+    async def console_get_one_model_batch(batch_id: str) -> dict[str, Any]:
+        try:
+            return one_model_batch_payload(batch_id)
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.post("/api/v1/console/one-model-batches/{batch_id}/pause")
+    async def console_pause_one_model_batch(batch_id: str) -> dict[str, Any]:
+        try:
+            await one_model_batches.pause(batch_id)
+            return one_model_batch_payload(batch_id)
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/api/v1/console/one-model-batches/{batch_id}/resume")
+    async def console_resume_one_model_batch(batch_id: str) -> dict[str, Any]:
+        try:
+            await one_model_batches.resume(batch_id)
+            return one_model_batch_payload(batch_id)
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/api/v1/console/one-model-batches/{batch_id}/cancel")
+    async def console_cancel_one_model_batch(batch_id: str) -> dict[str, Any]:
+        try:
+            await one_model_batches.cancel(batch_id)
+            return one_model_batch_payload(batch_id)
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    def verified_batch_report(batch_id: str):
+        batch = database.get_one_model_batch(batch_id)
+        if batch is None:
+            raise HTTPException(status_code=404, detail="one-model batch not found")
+        if not batch.report_path or not batch.report_sha256:
+            raise HTTPException(status_code=409, detail="batch report is not finalized")
+        expected_path = evidence.batch_report_path(batch_id)
+        try:
+            registered_path = evidence.verify_registered_path(
+                batch.report_path,
+                batch.report_sha256,
+                expected_path=expected_path,
+            )
+            # Credentials are deliberately destroyed when a batch terminates.  The
+            # report was scanned with the live credential canaries before its digest
+            # was registered; downloads re-check that immutable digest, canonical
+            # encoding and the full report schema without retaining the old keys.
+            return load_verified_batch_report(
+                registered_path,
+                batch.report_sha256,
+                secret_scanner=SecretCanaryScanner(()),
+            )
+        except FileNotFoundError as error:
+            raise HTTPException(status_code=404, detail="batch report is missing") from error
+        except (
+            BatchReportIntegrityError,
+            EvidenceIntegrityError,
+            SecretCanaryDetected,
+            OSError,
+        ) as error:
+            raise HTTPException(status_code=409, detail="batch report integrity failed") from error
+
+    @app.get(
+        "/api/v1/console/one-model-batches/{batch_id}/report.json",
+    )
+    async def console_download_one_model_batch_json(batch_id: str) -> Response:
+        verified = verified_batch_report(batch_id)
+        return Response(
+            content=verified.encoded,
+            media_type="application/json",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Evidence-SHA256": verified.sha256,
+                "Content-Disposition": (
+                    f'attachment; filename="one-model-batch-{batch_id}.json"'
+                ),
+            },
+        )
+
+    @app.get(
+        "/api/v1/console/one-model-batches/{batch_id}/report.csv",
+    )
+    async def console_download_one_model_batch_csv(batch_id: str) -> Response:
+        verified = verified_batch_report(batch_id)
+        try:
+            # Derive the download directly from the already verified canonical
+            # JSON.  Never rewrite a post-completion artifact after its credential
+            # canaries have intentionally left process memory.
+            encoded = csv_bytes_from_verified_report(verified)
+            csv_sha256 = hashlib.sha256(encoded).hexdigest()
+        except (
+            BatchReportIntegrityError,
+            EvidenceIntegrityError,
+            SecretCanaryDetected,
+            OSError,
+            ValueError,
+        ) as error:
+            raise HTTPException(status_code=409, detail="batch CSV generation failed") from error
+        return Response(
+            content=encoded,
+            media_type="text/csv",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Evidence-SHA256": csv_sha256,
+                "X-Source-JSON-SHA256": verified.sha256,
+                "Content-Disposition": (
+                    f'attachment; filename="one-model-batch-{batch_id}.csv"'
+                ),
+            },
+        )
+
+    def reference_collection_payload(batch_id: str) -> dict[str, Any]:
+        batch = database.get_reference_collection_batch(batch_id)
+        if batch is None:
+            raise LookupError(f"reference collection batch not found: {batch_id}")
+        items: list[dict[str, Any]] = []
+        for run, item in database.get_reference_collection_rows(batch_id):
+            artifact_path = Path(run.artifact_path) if run.artifact_path else None
+            items.append(
+                {
+                    "audit_id": run.id,
+                    "batch_id": item.batch_id,
+                    "model": item.model,
+                    "status": run.status,
+                    "verdict": run.verdict or run.status,
+                    "artifact_id": run.id if artifact_path and artifact_path.is_file() else None,
+                    "artifact_sha256": run.artifact_sha256,
+                    "baseline_id": item.baseline_id,
+                    "effective_concurrency": item.effective_concurrency,
+                    "concurrency_reason": item.concurrency_reason,
+                    "retry_count": item.retry_count,
+                    "progress": {
+                        "stage": item.stage,
+                        "done": item.done,
+                        "total": item.total,
+                        "errors": item.errors,
+                        "retry_count": item.retry_count,
+                        "detail": item.detail,
+                        "updated_at": item.as_dict()["updated_at"],
+                    },
+                    "error_message": run.error_message,
+                    "started_at": run.as_dict()["started_at"],
+                    "completed_at": run.as_dict()["completed_at"],
+                    "partial_evidence": bool(
+                        artifact_path
+                        and artifact_path.is_file()
+                        and run.status in {"paused", "canceled", "interrupted", "failed"}
+                    ),
+                    "samples_evidence_available": evidence.fingerprint_samples_path(
+                        run.id
+                    ).is_file(),
+                }
+            )
+        return {"batch": batch.as_dict(), "items": items}
+
+    @app.post("/api/v1/console/reference-collections", status_code=202)
+    async def console_create_reference_collection(
+        payload: ConsoleReferenceCollectionRequest,
+        response: Response,
+    ) -> dict[str, Any]:
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            batch_id = reference_batches.start(payload)
+        except ActiveBatchConflict as error:
+            raise HTTPException(
+                status_code=409,
+                detail={"message": str(error), "batch_id": error.batch_id},
+            ) from error
+        return reference_collection_payload(batch_id)
+
+    @app.get("/api/v1/console/reference-collections/active")
+    async def console_active_reference_collection() -> dict[str, Any]:
+        batch = database.latest_active_reference_collection_batch()
+        if batch is None:
+            return {"batch": None, "items": []}
+        return reference_collection_payload(batch.id)
+
+    @app.get("/api/v1/console/reference-collections/{batch_id}")
+    async def console_get_reference_collection(batch_id: str) -> dict[str, Any]:
+        try:
+            return reference_collection_payload(batch_id)
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.post("/api/v1/console/reference-collections/{batch_id}/pause")
+    async def console_pause_reference_collection(batch_id: str) -> dict[str, Any]:
+        try:
+            await reference_batches.pause(batch_id)
+            return reference_collection_payload(batch_id)
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/api/v1/console/reference-collections/{batch_id}/resume")
+    async def console_resume_reference_collection(batch_id: str) -> dict[str, Any]:
+        try:
+            await reference_batches.resume(batch_id)
+            return reference_collection_payload(batch_id)
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/api/v1/console/reference-collections/{batch_id}/cancel")
+    async def console_cancel_reference_collection(batch_id: str) -> dict[str, Any]:
+        try:
+            await reference_batches.cancel(batch_id)
+            return reference_collection_payload(batch_id)
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
     @app.get("/api/v1/console/references")
     async def console_list_references(
         request: Request,
@@ -1140,6 +1818,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 except EvidenceIntegrityError:
                     item["evidence_available"] = False
                     item["evidence_integrity"] = "corrupt"
+                metadata = baseline.get("metadata")
+                metadata = metadata if isinstance(metadata, dict) else {}
+                try:
+                    method_profile_id = evidence.fingerprint_method_profile(
+                        str(baseline["artifact_id"]),
+                        metadata=metadata,
+                    )
+                except FileNotFoundError:
+                    method_profile_id = str(
+                        metadata.get("method_profile_id") or LEGACY_ONE_TOKEN_PROFILE
+                    )
+                except ValueError as error:
+                    method_profile_id = str(
+                        metadata.get("method_profile_id") or LEGACY_ONE_TOKEN_PROFILE
+                    )
+                    item["method_profile_error"] = str(error)
+                item["method_profile_id"] = method_profile_id
+                samples_path = evidence.fingerprint_samples_path(str(baseline["artifact_id"]))
+                item["samples_evidence_available"] = samples_path.is_file()
+                item["raw_evidence_sha256"] = metadata.get("raw_evidence_sha256")
         return {"items": items}
 
     @app.delete("/api/v1/console/references/{baseline_id}")
@@ -1185,6 +1883,78 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             },
         )
 
+    @app.get(
+        "/api/v1/console/evidence/{artifact_id}/samples",
+        include_in_schema=False,
+    )
+    async def console_download_sample_evidence(artifact_id: str) -> Response:
+        run = database.get_run(artifact_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="audit evidence not found")
+        if run.detector not in {"one_token_collect", "one_token_verify"}:
+            raise HTTPException(status_code=404, detail="raw sample evidence is unavailable")
+        try:
+            samples_path = evidence.fingerprint_samples_path(
+                artifact_id,
+                must_exist=True,
+            )
+        except (FileNotFoundError, ValueError) as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        try:
+            registered_path = Path(run.artifact_path).resolve() if run.artifact_path else None
+            fingerprint_path = evidence.fingerprint_path(artifact_id)
+            verification_path = evidence.path_for("verification", artifact_id)
+            if registered_path == fingerprint_path:
+                expected_primary_path = fingerprint_path
+                primary_kind = "fingerprint"
+            elif run.detector == "one_token_verify" and registered_path == verification_path:
+                expected_primary_path = verification_path
+                primary_kind = "verification"
+            else:
+                raise EvidenceIntegrityError(
+                    "registered One Token evidence path is not a canonical artifact path"
+                )
+            primary = evidence.read_verified_json(
+                run.artifact_path,
+                run.artifact_sha256,
+                expected_path=expected_primary_path,
+            )
+            if primary_kind == "fingerprint":
+                if (
+                    primary.get("formatVersion") != 2
+                    or primary.get("protocol") != PAPER_ONE_TOKEN_PROFILE
+                ):
+                    raise EvidenceIntegrityError(
+                        "raw sample evidence requires a canonical V2 fingerprint"
+                    )
+                quality = primary.get("quality")
+                expected_sha256 = (
+                    quality.get("rawEvidenceSha256") if isinstance(quality, dict) else None
+                )
+            else:
+                if primary.get("methodProfileId") != PAPER_ONE_TOKEN_PROFILE:
+                    raise EvidenceIntegrityError(
+                        "raw sample evidence requires a canonical V2 verification"
+                    )
+                expected_sha256 = primary.get("targetRawEvidenceSha256")
+            sample_bytes = samples_path.read_bytes()
+            actual_sha256 = hashlib.sha256(sample_bytes).hexdigest()
+            if not isinstance(expected_sha256, str) or expected_sha256 != actual_sha256:
+                raise ValueError("raw sample evidence SHA-256 does not match its fingerprint")
+        except (FileNotFoundError, ValueError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return Response(
+            content=sample_bytes,
+            media_type="application/x-ndjson",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Evidence-SHA256": actual_sha256,
+                "Content-Disposition": (
+                    f'attachment; filename="one-token-samples-{artifact_id}.jsonl"'
+                ),
+            },
+        )
+
     @app.post("/api/v1/console/fingerprints/collect", response_model=AuditResponse)
     async def console_collect_fingerprint(
         payload: ConsoleFingerprintCollectRequest,
@@ -1202,9 +1972,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         output_path = evidence.fingerprint_path(audit_id)
         try:
-            result = await fingerprint.collect(
+            result = await collect_one_token_profile(
                 endpoint,
-                output_path=output_path,
+                audit_id=audit_id,
+                method_profile_id=payload.method_profile_id,
                 cells=payload.cells,
                 samples=payload.samples,
                 concurrency=payload.concurrency,
@@ -1247,6 +2018,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> ConsoleReferenceCollectResponse:
         audit = await console_collect_fingerprint(payload, response)
         endpoint = payload.endpoint.public_endpoint()
+        paper_collection = (
+            audit.result.get("collection")
+            if payload.method_profile_id == PAPER_ONE_TOKEN_PROFILE
+            else None
+        )
+        raw_evidence_sha256 = (
+            paper_collection.get("rawEvidenceSha256")
+            if isinstance(paper_collection, dict)
+            else None
+        )
+        profile_cells = (
+            40 if payload.method_profile_id == PAPER_ONE_TOKEN_PROFILE else payload.cells
+        )
+        fingerprint_protocol = (
+            PAPER_ONE_TOKEN_PROFILE
+            if payload.method_profile_id == PAPER_ONE_TOKEN_PROFILE
+            else "one-token/v1"
+        )
         raw_name = f"{payload.reference_name.strip()} · {endpoint.model}"
         if len(raw_name) > 100:
             suffix = hashlib.sha256(raw_name.encode()).hexdigest()[:8]
@@ -1270,14 +2059,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             metadata={
                 "source": "local_console",
                 "reference_name": payload.reference_name.strip(),
-                "cells": payload.cells,
+                "cells": profile_cells,
                 "samples": payload.samples,
                 "concurrency": payload.concurrency,
-                "protocol": "one-token/v1",
-                "method_profile_id": "legacy-one-token/v1",
+                "protocol": fingerprint_protocol,
+                "method_profile_id": payload.method_profile_id,
                 "ground_truth": "unverified_user_reference",
                 "decision_eligible": False,
                 "calibration_policy_id": None,
+                "raw_evidence_sha256": raw_evidence_sha256,
             },
         )
         return ConsoleReferenceCollectResponse(
@@ -1290,6 +2080,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "model": managed.model,
                 "artifact_id": audit.audit_id,
                 "artifact_sha256": audit.artifact_sha256,
+                "method_profile_id": payload.method_profile_id,
+                "protocol": fingerprint_protocol,
+                "samples_evidence_available": (
+                    payload.method_profile_id == PAPER_ONE_TOKEN_PROFILE
+                    and evidence.fingerprint_samples_path(audit.audit_id).is_file()
+                ),
+                "raw_evidence_sha256": raw_evidence_sha256,
                 "status": baseline.status,
                 "valid_from": baseline.as_dict()["valid_from"],
                 "expires_at": baseline.as_dict()["expires_at"],
@@ -1313,26 +2110,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             model=endpoint.model,
         )
         try:
-            reference_path = verified_reference_path(
-                payload.reference_artifact_id,
-                category="fingerprints",
-                detector="one_token_collect",
-            )
-            reference_metadata = database.get_reference_metadata(payload.reference_artifact_id)
             target_path = evidence.fingerprint_path(audit_id)
-            verdict, result = await fingerprint.verify(
+            verdict, result, _method_profile_id = await verify_one_token_profile(
                 endpoint,
-                reference_path=reference_path,
-                output_path=target_path,
+                audit_id=audit_id,
+                reference_artifact_id=payload.reference_artifact_id,
                 cells=payload.cells,
                 samples=payload.samples,
                 concurrency=payload.concurrency,
                 api_key=api_key,
-            )
-            verdict, result = safeguard_verification_result(
-                verdict,
-                result,
-                reference_metadata=reference_metadata,
+                expected_method_profile_id=(
+                    payload.method_profile_id
+                    if "method_profile_id" in payload.model_fields_set
+                    else None
+                ),
             )
             result = {
                 **result,

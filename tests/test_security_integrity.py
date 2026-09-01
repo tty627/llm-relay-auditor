@@ -277,7 +277,7 @@ def test_tampered_reference_fails_before_sampling(
             },
         )
         assert response.status_code == 409
-        assert "SHA-256" in response.json()["detail"]
+        assert response.json()["detail"] == "evidence_integrity_failed"
 
         batch = client.post(
             "/api/v1/console/comparison-batches",

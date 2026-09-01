@@ -8,6 +8,7 @@
     <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="/assets/styles.css">
     <script src="/assets/status.js" defer></script>
+    <script src="/assets/profiles.js" defer></script>
     <script src="/assets/app.js" defer></script>
   </head>
   <body>
@@ -22,7 +23,7 @@
         </a>
         <div class="topbar-actions">
           <span class="status-pill"><i></i> 本地证据库</span>
-          <span id="workspace-status" class="draft-status">准备恢复工作区…</span>
+          <span id="workspace-status" class="draft-status">配置仅保留在当前页面</span>
           <a class="text-link" href="/history">对比记录</a>
           <a class="text-link" href="/docs" target="_blank" rel="noreferrer">API 文档</a>
         </div>
@@ -51,6 +52,256 @@
           </div>
           <button id="clear-keys" class="button button-ghost" type="button">清空全部 Key</button>
         </section>
+
+        <section id="one-model-workbench" class="one-model-workbench" aria-labelledby="one-model-title">
+          <div class="workbench-heading">
+            <div>
+              <p class="eyebrow">OPUS 5 · SINGLE MODEL AUDIT</p>
+              <h2 id="one-model-title">单模型批量中转站审计</h2>
+              <p>先冻结三轮参考指纹，再用同一协议测试 1–20 个中转站。所有结论仅表示相对参考快照的一致性。</p>
+            </div>
+            <span id="one-model-api-status" class="badge badge-muted">正在连接新批次 API</span>
+          </div>
+
+          <div class="one-model-grid">
+            <section class="panel one-model-reference-panel">
+              <div class="panel-heading">
+                <div>
+                  <span class="step-number">A</span>
+                  <h2>建立三成员参考集</h2>
+                </div>
+                <span class="badge badge-running">3 × 40 × 30</span>
+              </div>
+              <form id="reference-set-form" autocomplete="off">
+                <div class="field-row one-model-pair">
+                  <label>
+                    <span>参考集名称</span>
+                    <input id="reference-set-name" required maxlength="60" placeholder="Official Opus 5 · 2026-08-31">
+                  </label>
+                  <label>
+                    <span>来源声明</span>
+                    <select id="reference-source-type">
+                      <option value="official_api">官方 API</option>
+                      <option value="trusted_relay">可信中转站</option>
+                    </select>
+                  </label>
+                </div>
+                <div class="field-row one-model-pair">
+                  <label>
+                    <span>API 协议</span>
+                    <select id="reference-protocol">
+                      <option value="anthropic_messages" selected>Anthropic Messages</option>
+                      <option value="openai_chat">OpenAI Chat Compatible</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>固定 transport profile</span>
+                    <input id="reference-transport-profile" readonly value="anthropic-messages-opus5-onetoken-v1">
+                  </label>
+                </div>
+                <div class="field-row one-model-pair">
+                  <label>
+                    <span>逻辑模型</span>
+                    <input id="reference-logical-model" required value="opus-5" maxlength="255">
+                  </label>
+                  <label>
+                    <span>参考端实际模型 ID</span>
+                    <input id="reference-actual-model" required value="claude-opus-5" maxlength="255" spellcheck="false">
+                  </label>
+                </div>
+                <label>
+                  <span>参考 API Base URL</span>
+                  <input id="reference-set-url" type="url" required value="https://api.anthropic.com/v1"
+                    placeholder="https://api.anthropic.com/v1" spellcheck="false">
+                </label>
+                <div class="field-row reference-credential-row">
+                  <label>
+                    <span>凭据来源</span>
+                    <select id="reference-credential-mode">
+                      <option value="ephemeral" selected>临时 API Key</option>
+                      <option value="env_ref">服务端环境变量</option>
+                    </select>
+                  </label>
+                  <label id="reference-ephemeral-wrap">
+                    <span>API Key <em>提交后立即清空</em></span>
+                    <input id="reference-set-key" class="api-key" type="password" autocomplete="new-password"
+                      placeholder="sk-…" spellcheck="false">
+                  </label>
+                  <label id="reference-env-wrap" class="hidden">
+                    <span>允许的环境变量名</span>
+                    <input id="reference-set-env" placeholder="ANTHROPIC_API_KEY" pattern="[A-Z_][A-Z0-9_]*" spellcheck="false">
+                  </label>
+                </div>
+                <label id="anthropic-workspace-wrap">
+                  <span>Anthropic Workspace ID <em>可选</em></span>
+                  <input id="anthropic-workspace-id" maxlength="255" placeholder="workspace_…" spellcheck="false">
+                </label>
+                <div class="frozen-contract">
+                  <span>固定协议</span><strong>40 cells × 30 samples</strong>
+                  <span>独立成员</span><strong>3 轮顺序采集</strong>
+                  <span>基础请求</span><strong id="reference-set-estimate">3,600</strong>
+                  <small>Thinking 显式关闭；跨协议参考不可用于本批比较。重试不计入基础请求。</small>
+                </div>
+                <button id="create-reference-set" class="button button-primary button-full" type="submit">
+                  采集三轮参考指纹
+                </button>
+              </form>
+              <div id="reference-set-form-message" class="inline-message" aria-live="polite"></div>
+              <section id="reference-set-progress" class="reference-set-progress hidden" aria-live="polite">
+                <div class="reference-set-progress-heading">
+                  <div>
+                    <strong id="reference-set-progress-title">参考集采集中</strong>
+                    <small id="reference-set-progress-meta"></small>
+                  </div>
+                  <div class="compact-actions reference-set-controls">
+                    <button id="reference-set-pause" type="button" data-allow-busy="true">暂停</button>
+                    <button id="reference-set-cancel" type="button" data-allow-busy="true">取消</button>
+                  </div>
+                </div>
+                <div id="reference-set-members" class="reference-set-members"></div>
+                <div id="reference-set-distances" class="reference-set-distances"></div>
+              </section>
+            </section>
+
+            <section class="panel ready-reference-panel">
+              <div class="panel-heading">
+                <div>
+                  <span class="step-number">REF</span>
+                  <h2>可用于比较的 ReferenceSet</h2>
+                </div>
+                <button id="refresh-reference-sets" class="button button-ghost" type="button">刷新</button>
+              </div>
+              <p class="panel-intro">只有三成员均完成、哈希一致且内部统计已封存的参考集可被选择。</p>
+              <div id="ready-reference-sets" class="ready-reference-sets">
+                <div class="compact-empty"><strong>暂无 ready 参考集</strong><p>完成左侧三轮采集后会自动出现。</p></div>
+              </div>
+            </section>
+          </div>
+
+          <section class="panel one-model-target-panel">
+            <div class="panel-heading">
+              <div>
+                <span class="step-number">B</span>
+                <h2>批量目标站</h2>
+              </div>
+              <span id="one-model-target-count" class="badge badge-muted">0 / 20</span>
+            </div>
+            <div class="one-model-batch-settings">
+              <label>
+                <span>ReferenceSet</span>
+                <select id="one-model-reference-select" required>
+                  <option value="">先建立或选择 ready 参考集</option>
+                </select>
+              </label>
+              <label>
+                <span>默认目标模型 ID</span>
+                <input id="one-model-default-model" value="claude-opus-5" maxlength="255" spellcheck="false">
+              </label>
+              <label>
+                <span>并行站点</span>
+                <input id="one-model-max-stations" type="number" min="1" max="8" value="4">
+              </label>
+              <label>
+                <span>每站并发</span>
+                <input id="one-model-per-station" type="number" min="1" max="4" value="3">
+              </label>
+              <label>
+                <span>全局并发</span>
+                <input id="one-model-global-concurrency" type="number" min="1" max="16" value="12">
+              </label>
+            </div>
+            <div class="tsv-import">
+              <label>
+                <span>粘贴 TSV <em>station_name　base_url　api_key 或 env:NAME　可选 model_id</em></span>
+                <textarea id="one-model-tsv" rows="5" autocomplete="off" spellcheck="false"
+                  placeholder="Relay A&#9;https://a.example/v1&#9;sk-…&#9;claude-opus-5&#10;Relay B&#9;https://b.example/v1&#9;env:RELAY_B_KEY&#9;opus-5-alias"></textarea>
+              </label>
+              <div class="tsv-actions">
+                <button id="import-one-model-tsv" class="button button-secondary" type="button">校验并导入</button>
+                <button id="add-one-model-target" class="button button-ghost" type="button">添加空行</button>
+                <button id="clear-one-model-targets" class="button button-ghost" type="button">清空目标</button>
+              </div>
+              <div id="one-model-import-message" class="inline-message" aria-live="polite"></div>
+            </div>
+            <div class="one-model-target-table-wrap">
+              <table class="one-model-target-table">
+                <thead>
+                  <tr>
+                    <th>#</th><th>站点名称</th><th>规范化 Base URL</th><th>凭据</th><th>模型别名</th><th>校验</th><th></th>
+                  </tr>
+                </thead>
+                <tbody id="one-model-target-rows"></tbody>
+              </table>
+            </div>
+            <div class="one-model-run-bar">
+              <div class="request-budget">
+                <span>参考集采集</span><strong>3,600</strong>
+                <span>本批目标</span><strong id="one-model-target-estimate">0</strong>
+                <span>总基础请求</span><strong id="one-model-total-estimate">3,600</strong>
+                <small>每站固定 1,200 次逻辑采样；额外重试受每站 240 次硬预算限制。</small>
+              </div>
+              <button id="run-one-model-batch" class="button button-primary" type="button" disabled>
+                开始单模型批量测试
+              </button>
+            </div>
+          </section>
+
+          <section id="one-model-results-panel" class="panel one-model-results-panel">
+            <div class="panel-heading">
+              <div>
+                <span class="step-number">C</span>
+                <h2>批次进度与结果</h2>
+              </div>
+              <div class="one-model-result-actions">
+                <select id="one-model-result-filter" aria-label="筛选结果">
+                  <option value="">全部状态</option>
+                  <option value="exploratory_reference_like">相对参考相似</option>
+                  <option value="exploratory_reference_deviation">偏离参考</option>
+                  <option value="inconclusive">区间重叠</option>
+                  <option value="insufficient_quality">质量不足</option>
+                  <option value="unsupported_protocol">协议不兼容</option>
+                  <option value="request_failed">请求失败</option>
+                  <option value="active">执行中 / 排队</option>
+                  <option value="has_error">含错误样本或失败</option>
+                </select>
+                <select id="one-model-result-sort" aria-label="结果排序">
+                  <option value="input">输入顺序</option>
+                  <option value="jsd_asc">JSD 从小到大</option>
+                  <option value="quality_desc">质量从高到低</option>
+                  <option value="errors_desc">错误从多到少</option>
+                  <option value="latency_asc">p95 从快到慢</option>
+                  <option value="status">按状态</option>
+                </select>
+                <a id="one-model-json-download" class="button button-ghost hidden" href="#" download>下载 JSON</a>
+                <a id="one-model-csv-download" class="button button-ghost hidden" href="#" download>下载 CSV</a>
+              </div>
+            </div>
+            <div class="one-model-batch-progress">
+              <div>
+                <strong id="one-model-batch-status">尚未创建批次</strong>
+                <small id="one-model-batch-meta">可通过 URL 中的 batch_id 在刷新后恢复。</small>
+              </div>
+              <div class="one-model-batch-controls">
+                <button id="one-model-pause" class="button button-secondary hidden" type="button" data-allow-busy="true">暂停</button>
+                <button id="one-model-cancel" class="button button-danger hidden" type="button" data-allow-busy="true">取消</button>
+              </div>
+            </div>
+            <div class="one-model-result-table-wrap">
+              <table class="one-model-result-table">
+                <thead>
+                  <tr><th>站点</th><th>状态</th><th>质量</th><th>JSD 中位数</th><th>p50 / p95</th><th>重试</th><th>原因</th></tr>
+                </thead>
+                <tbody id="one-model-result-rows">
+                  <tr><td colspan="7" class="table-empty">等待批次结果</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
+        <details class="legacy-workspace">
+          <summary>旧版多模型映射工作台（兼容模式）</summary>
+          <div class="legacy-workspace-body">
 
         <div class="workspace-grid reference-grid">
           <section class="panel setup-panel">
@@ -106,10 +357,18 @@
               </div>
 
               <div class="settings-block">
+                <label class="profile-selector">
+                  <span>指纹方法</span>
+                  <select id="method-profile">
+                    <option value="bruckner-2026-canonical40/v1" selected>论文 V2 高保真 · 40 × 30</option>
+                    <option value="legacy-one-token/v1">旧版探索模式 · 使用下方规格</option>
+                  </select>
+                  <small id="method-profile-note" class="setting-note">作者固定 10×4 探针、直接采样并保存逐请求 JSONL；没有校准策略时只输出统计距离。</small>
+                </label>
                 <div class="field-row strategy-row">
                   <label>
                     <span>采样规格</span>
-                    <select id="preset">
+                    <select id="preset" disabled>
                       <option value="quick">快速 · 4 × 15</option>
                       <option value="standard" selected>标准 · 8 × 25</option>
                       <option value="strict">严格 · 16 × 25</option>
@@ -137,13 +396,13 @@
                     <input id="model-timeout" type="number" min="30" max="1800" value="300">
                   </label>
                 </div>
-                <small id="concurrency-note" class="setting-note">自动模式会按每个中转站的历史稳定性选择并发；连续无进度上限只在长期没有新响应时中断，不限制任务总时长。</small>
+                <small id="concurrency-note" class="setting-note">参考首模型从并发 ≤2 开始并按本批错误与重试升降；中转站对比按同端点与模型历史选择。连续无进度上限不限制任务总时长。</small>
                 <div class="cost-preview">
                   <span>当前预计请求</span>
                   <strong id="request-estimate">—</strong>
                   <span>预计采样时间</span>
                   <strong id="time-estimate">—</strong>
-                  <small id="time-estimate-note">首次按网络请求耗时粗估；完成模型后会用实际速度更新剩余时间。</small>
+                  <small id="time-estimate-note">自动模式下参考首项从并发 ≤2 开始；中转站对比优先采用历史稳定并发。</small>
                 </div>
               </div>
 
@@ -152,6 +411,25 @@
               </button>
             </form>
             <div id="reference-progress" class="reference-summary hidden" aria-live="polite"></div>
+            <section id="active-reference-panel" class="reference-collection-panel hidden" aria-live="polite">
+              <div class="reference-collection-heading">
+                <div>
+                  <span class="live-dot" aria-hidden="true"></span>
+                  <div>
+                    <strong id="active-reference-status">正在读取参考采集状态…</strong>
+                    <span id="active-reference-counts" class="batch-state-summary"></span>
+                  </div>
+                </div>
+                <div class="reference-collection-actions">
+                  <button id="retry-reference-recovery" class="button button-ghost hidden" type="button" data-allow-busy="true">重试恢复</button>
+                  <button id="pause-reference" class="button button-secondary" type="button" data-allow-busy="true">暂停采集</button>
+                  <button id="cancel-reference" class="button button-danger" type="button" data-allow-busy="true">取消采集</button>
+                </div>
+              </div>
+              <p id="active-reference-current" class="reference-collection-current"></p>
+              <div id="active-reference-list" class="reference-collection-list"></div>
+              <small class="reference-collection-note">参考采集由本地服务持续执行；刷新页面会重新关联任务，Key 不会写入工作区或证据。</small>
+            </section>
           </section>
 
           <section class="panel library-panel">
@@ -189,6 +467,7 @@
               <p id="mapping-time-estimate">预计耗时将在选择模型后显示。</p>
             </div>
             <div class="run-actions">
+              <button id="retry-comparison-recovery" class="button button-ghost hidden" type="button" data-allow-busy="true">重试恢复</button>
               <button id="pause-batch" class="button button-secondary hidden" type="button" data-allow-busy="true">暂停任务</button>
               <button id="cancel-batch" class="button button-danger hidden" type="button" data-allow-busy="true">取消批次</button>
               <button id="run-all" class="button button-primary" type="button" disabled>开始全部对比</button>
@@ -232,6 +511,8 @@
           </div>
           <div id="results" class="results-grid"></div>
         </section>
+          </div>
+        </details>
       </main>
 
       <footer>

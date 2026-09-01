@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -247,11 +248,180 @@ async def test_model_id_cannot_be_mistaken_for_cli_subcommand(
     assert arguments[model_index] == model
 
 
+async def test_collect_forwards_long_task_controls_and_request_timeout(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cli_path = tmp_path / "cli.js"
+    cli_path.write_text("// test stub\n", encoding="utf-8")
+    runner = FingerprintRunner(cli_path)
+    captured: dict[str, object] = {}
+    progress: list[dict] = []
+    cancel_event = asyncio.Event()
+
+    async def fake_execute_with_code(
+        arguments,
+        *,
+        accepted_exit_codes,
+        environment,
+        progress_callback,
+        cancel_event,
+        idle_timeout_seconds,
+    ):
+        captured.update(
+            arguments=arguments,
+            accepted_exit_codes=accepted_exit_codes,
+            environment=environment,
+            progress_callback=progress_callback,
+            cancel_event=cancel_event,
+            idle_timeout_seconds=idle_timeout_seconds,
+        )
+        progress_callback(
+            {
+                "stage": "sampling",
+                "done": 1,
+                "total": 4,
+                "errors": 0,
+                "retrying": False,
+            }
+        )
+        return 0, {"fingerprint": {"model": "target-model"}}
+
+    monkeypatch.setattr(runner, "_execute_with_code", fake_execute_with_code)
+    result = await runner.collect(
+        EndpointSpec(base_url="https://relay.example/v1", model="target-model"),
+        output_path=tmp_path / "fingerprint.json",
+        cells=4,
+        samples=10,
+        concurrency=2,
+        progress_callback=progress.append,
+        cancel_event=cancel_event,
+        request_timeout_ms=45_000,
+        idle_timeout_seconds=30,
+    )
+
+    arguments = captured["arguments"]
+    assert isinstance(arguments, list)
+    assert arguments[2] == "fingerprint"
+    assert arguments[arguments.index("--timeout") + 1] == "45000"
+    assert "--quiet" not in arguments
+    assert captured["progress_callback"] == progress.append
+    assert captured["cancel_event"] is cancel_event
+    assert captured["idle_timeout_seconds"] == 30
+    assert progress[0]["done"] == 1
+    assert result == {"fingerprint": {"model": "target-model"}}
+
+
+@pytest.mark.parametrize(
+    ("interruption", "expected_error", "expected_reason"),
+    [
+        ("pause", FingerprintPausedError, "execution_interrupted"),
+        ("stall", FingerprintStalledError, "progress_timeout"),
+    ],
+)
+async def test_collect_interruption_marks_and_exposes_partial_summary(
+    tmp_path: Path,
+    monkeypatch,
+    interruption: str,
+    expected_error: type[Exception],
+    expected_reason: str,
+) -> None:
+    cli_path = tmp_path / "cli.js"
+    cli_path.write_text("// test stub\n", encoding="utf-8")
+    output_path = tmp_path / "partial.json"
+    runner = FingerprintRunner(cli_path)
+
+    async def fake_execute(*args, **kwargs):
+        partial = write_fingerprint(output_path, model="target-model")
+        partial.update(
+            {
+                "partial": True,
+                "completedSamples": 6,
+                "expectedSamples": 40,
+                "errorCount": 1,
+                "incompleteReason": "sampling_in_progress",
+            }
+        )
+        output_path.write_text(json.dumps(partial), encoding="utf-8")
+        if interruption == "pause":
+            raise FingerprintPausedError("paused")
+        raise FingerprintStalledError(30)
+
+    monkeypatch.setattr(runner, "_execute_with_code", fake_execute)
+    call_options = (
+        {"cancel_event": asyncio.Event()}
+        if interruption == "pause"
+        else {"idle_timeout_seconds": 30}
+    )
+    with pytest.raises(expected_error) as caught:
+        await runner.collect(
+            EndpointSpec(base_url="https://relay.example/v1", model="target-model"),
+            output_path=output_path,
+            cells=4,
+            samples=10,
+            concurrency=1,
+            **call_options,
+        )
+
+    assert caught.value.partial_artifact == {
+        "partial": True,
+        "completedSamples": 6,
+        "expectedSamples": 40,
+        "errorCount": 1,
+        "incompleteReason": expected_reason,
+        "model": "target-model",
+    }
+    assert (
+        json.loads(output_path.read_text(encoding="utf-8"))["incompleteReason"] == expected_reason
+    )
+
+
+async def test_collect_task_cancellation_marks_existing_partial(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cli_path = tmp_path / "cli.js"
+    cli_path.write_text("// test stub\n", encoding="utf-8")
+    output_path = tmp_path / "partial.json"
+    runner = FingerprintRunner(cli_path)
+
+    async def fake_execute(*args, **kwargs):
+        partial = write_fingerprint(output_path, model="target-model")
+        partial.update(
+            {
+                "partial": True,
+                "completedSamples": 2,
+                "expectedSamples": 40,
+                "errorCount": 0,
+                "incompleteReason": "sampling_in_progress",
+            }
+        )
+        output_path.write_text(json.dumps(partial), encoding="utf-8")
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(runner, "_execute_with_code", fake_execute)
+    with pytest.raises(asyncio.CancelledError):
+        await runner.collect(
+            EndpointSpec(base_url="https://relay.example/v1", model="target-model"),
+            output_path=output_path,
+            cells=4,
+            samples=10,
+            concurrency=1,
+            progress_callback=lambda event: None,
+        )
+
+    assert (
+        json.loads(output_path.read_text(encoding="utf-8"))["incompleteReason"]
+        == "execution_interrupted"
+    )
+
+
 def test_parse_jsonl_progress_preserves_safe_error_state() -> None:
     event = FingerprintRunner._parse_progress_line(
         'LLMFP_PROGRESS {"stage":"sampling","done":7,"total":40,'
         '"errors":2,"detail":"retry 1/2 in 5000ms",'
-        '"lastErrorKind":"http","lastHttpStatus":503,"retrying":true}\n'
+        '"lastErrorKind":"http","lastHttpStatus":503,"retrying":true,'
+        '"attemptCount":9,"retryCount":2,"retryBudgetUsed":3}\n'
     )
     assert event == {
         "stage": "sampling",
@@ -262,6 +432,9 @@ def test_parse_jsonl_progress_preserves_safe_error_state() -> None:
         "lastErrorKind": "http",
         "lastHttpStatus": 503,
         "retrying": True,
+        "attemptCount": 9,
+        "retryCount": 2,
+        "retryBudgetUsed": 3,
     }
     assert FingerprintRunner._parse_progress_line("LLMFP_PROGRESS {not-json}\n") is None
 
@@ -344,6 +517,79 @@ async def test_user_cancellation_stops_child_before_idle_timeout(tmp_path: Path)
 
     with pytest.raises(FingerprintPausedError):
         await asyncio.wait_for(pending, timeout=0.5)
+
+
+@pytest.mark.parametrize(
+    ("interruption", "expected_error", "expected_reason"),
+    [
+        ("pause", FingerprintPausedError, "execution_interrupted"),
+        ("stall", FingerprintStalledError, "progress_timeout"),
+    ],
+)
+async def test_collect_interruption_terminates_child_and_marks_its_checkpoint(
+    tmp_path: Path,
+    interruption: str,
+    expected_error: type[Exception],
+    expected_reason: str,
+) -> None:
+    cli_path = tmp_path / "collect-stub.cjs"
+    cli_path.write_text(
+        """
+const fs = require('node:fs');
+const output = process.argv[process.argv.indexOf('--out') + 1];
+fs.writeFileSync(output, JSON.stringify({
+  formatVersion: 1,
+  protocol: 'one-token/v1',
+  model: 'target-model',
+  collectedAt: '2026-08-20T00:00:00.000Z',
+  samplesPerCell: 10,
+  postReasoning: false,
+  cells: {},
+  partial: true,
+  completedSamples: 3,
+  expectedSamples: 40,
+  errorCount: 0,
+  incompleteReason: 'sampling_in_progress',
+}));
+process.on('SIGTERM', () => {
+  fs.writeFileSync(`${output}.stopped`, 'SIGTERM');
+  process.exit(0);
+});
+setInterval(() => {}, 1000);
+""",
+        encoding="utf-8",
+    )
+    runner = FingerprintRunner(cli_path)
+    output_path = tmp_path / "partial.json"
+    cancel_event = asyncio.Event()
+    pending = asyncio.create_task(
+        runner.collect(
+            EndpointSpec(base_url="https://relay.example/v1", model="target-model"),
+            output_path=output_path,
+            cells=4,
+            samples=10,
+            concurrency=1,
+            cancel_event=cancel_event if interruption == "pause" else None,
+            idle_timeout_seconds=1 if interruption == "pause" else 0.1,
+        )
+    )
+    if interruption == "pause":
+        for _ in range(50):
+            if output_path.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert output_path.exists()
+        cancel_event.set()
+
+    with pytest.raises(expected_error) as caught:
+        await asyncio.wait_for(pending, timeout=1)
+
+    assert (tmp_path / "partial.json.stopped").read_text(encoding="utf-8") == "SIGTERM"
+    assert caught.value.partial_artifact is not None
+    assert caught.value.partial_artifact["incompleteReason"] == expected_reason
+    assert (
+        json.loads(output_path.read_text(encoding="utf-8"))["incompleteReason"] == expected_reason
+    )
 
 
 def test_partial_artifact_summary_and_atomic_interruption_annotation(tmp_path: Path) -> None:
@@ -745,7 +991,7 @@ def test_safeguard_fails_closed_when_explicit_and_comparison_verdicts_conflict()
     assert safe_payload["decision"]["reasons"] == ["legacy_verdict_insufficient"]
 
 
-async def test_invalid_cli_json_diagnostic_redacts_ephemeral_key(
+async def test_invalid_cli_json_credential_echo_fails_closed(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -766,7 +1012,7 @@ async def test_invalid_cli_json_diagnostic_redacts_ephemeral_key(
         return FakeProcess()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess)
-    with pytest.raises(InvalidCliJsonError) as caught:
+    with pytest.raises(RuntimeError, match="possible credential echo") as caught:
         await runner._execute_with_code(
             ["node", str(cli_path), "verify", "--api-key-env", env_name],
             accepted_exit_codes={0},
@@ -774,13 +1020,64 @@ async def test_invalid_cli_json_diagnostic_redacts_ephemeral_key(
         )
 
     message = str(caught.value)
-    assert "exit code 0" in message
-    assert "11 stdout bytes" in message
-    assert "line 1, column 12" in message
-    assert "stdout appears truncated" in message
     assert secret not in message
-    assert "[REDACTED]" in message
-    assert caught.value.safe_diagnostic["likely_truncated"] is True
+
+
+@pytest.mark.parametrize(
+    ("channel", "secret", "echoed"),
+    [
+        ("stdout", "sk-Exact-Canary-441", "sk-Exact-Canary-441"),
+        ("stderr", "Sk-CaseFold-Canary-552", "sk-casefold-canary-552"),
+        (
+            "stderr",
+            "SÉcret-NFC-Canary-663",
+            unicodedata.normalize("NFD", "SÉcret-NFC-Canary-663"),
+        ),
+        ("progress", "sk-Progress-１２３-Key", "skprogress123key"),
+    ],
+)
+async def test_child_output_channels_abort_on_all_credential_echo_variants(
+    tmp_path: Path,
+    channel: str,
+    secret: str,
+    echoed: str,
+) -> None:
+    """Independently exercise stdout, stderr and progress before persistence."""
+
+    cli_path = tmp_path / f"echo-{channel}.cjs"
+    encoded_echo = json.dumps(echoed)
+    if channel == "stdout":
+        program = f"process.stdout.write(JSON.stringify({{echo:{encoded_echo}}}));\n"
+    elif channel == "stderr":
+        program = (
+            f"process.stderr.write({encoded_echo});\n"
+            "process.stdout.write('{}');\n"
+        )
+    else:
+        program = (
+            "process.stderr.write('LLMFP_PROGRESS ' + JSON.stringify({"
+            "stage:'sampling',done:0,total:1200,errors:0,retrying:false,"
+            f"detail:{encoded_echo}"
+            "}) + '\\n');\n"
+            "process.stdout.write('{}');\n"
+        )
+    cli_path.write_text(program, encoding="utf-8")
+    runner = FingerprintRunner(cli_path)
+    env_name = "RELAY_AUDITOR_EPHEMERAL_CANARY_TEST"
+    progress: list[dict] = []
+
+    with pytest.raises(RuntimeError, match="possible credential echo") as caught:
+        await runner._execute_with_code(
+            ["node", str(cli_path), "verify", "--api-key-env", env_name],
+            accepted_exit_codes={0},
+            environment={**FingerprintRunner._offline_environment(), env_name: secret},
+            progress_callback=progress.append,
+        )
+
+    diagnostic = str(caught.value)
+    assert secret.casefold() not in diagnostic.casefold()
+    assert echoed.casefold() not in diagnostic.casefold()
+    assert progress == []
 
 
 async def test_recover_failed_verification_creates_new_audit_without_network(

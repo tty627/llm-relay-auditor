@@ -317,6 +317,15 @@ function renderBatch(batchId, items) {
       }
       actions.append(evidence);
     }
+    const rawSamples = relayStatus.rawSampleEvidenceInfo(item);
+    if (rawSamples.available) {
+      const samples = document.createElement("a");
+      samples.className = "evidence-link";
+      samples.href = `/api/v1/console/evidence/${rawSamples.artifactId}/samples`;
+      samples.textContent = partial.isPartial ? "部分原始 JSONL" : "原始 JSONL";
+      if (rawSamples.sha256) samples.title = `SHA-256 ${rawSamples.sha256}`;
+      actions.append(samples);
+    }
     const load = document.createElement("button");
     load.type = "button";
     load.className = "reference-delete history-load-button";

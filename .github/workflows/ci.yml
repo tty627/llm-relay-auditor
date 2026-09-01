@@ -28,7 +28,7 @@ jobs:
       - name: Install auditor
         run: pip install -e '.[dev]'
       - name: Test console JavaScript
-        run: node --test tests/web_status.test.js
+        run: node --test tests/web_status.test.js tests/web_profiles.test.js
       - name: Lint
         run: ruff check .
       - name: Test

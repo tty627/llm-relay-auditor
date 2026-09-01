@@ -280,6 +280,9 @@ def import_reference_directory(
                 run.artifact_sha256 = artifact.sha256
                 run.error_message = None
 
+            # Expiry and snapshot chronology, rather than import order,
+            # determine which baseline is active. Re-importing an older file
+            # must never roll the catalog back from a newer snapshot.
             session.execute(
                 update(Baseline)
                 .where(

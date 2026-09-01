@@ -702,6 +702,88 @@
     return parts.length ? parts.join(" · ") : "";
   }
 
+  function conflictBatchId(value) {
+    if (value instanceof Error) {
+      return conflictBatchId(value.detail ?? value.body?.detail ?? value.body);
+    }
+    if (value && typeof value === "object") {
+      const direct = firstValue(
+        value.batch_id,
+        value.batchId,
+        value.reference_collection_id,
+        value.referenceCollectionId,
+      );
+      if (direct) return String(direct);
+      if (value.detail !== undefined) return conflictBatchId(value.detail);
+      return "";
+    }
+    if (typeof value !== "string") return "";
+    const text = value.trim();
+    if (!text) return "";
+    try {
+      const parsed = JSON.parse(text);
+      const parsedId = conflictBatchId(parsed);
+      if (parsedId) return parsedId;
+    } catch {
+      // Plain-text FastAPI errors are handled by the UUID fallback below.
+    }
+    return text.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i)?.[0]
+      || "";
+  }
+
+  function referenceCollectionSummary(items = []) {
+    const counts = batchStateCounts(items);
+    const partial = items.filter((item) => Boolean(
+      item?.partial_evidence
+      || item?.partialEvidence
+      || partialEvidenceInfo(item).isPartial,
+    )).length;
+    const current = items.find((item) => ["running", "canceling"].includes(
+      normalizedText(item?.status),
+    )) || items.find((item) => itemOperationalState(item) === "waiting") || null;
+    return {
+      ...counts,
+      partial,
+      currentModel: current?.model ? String(current.model) : "",
+      currentAuditId: current?.audit_id ? String(current.audit_id) : "",
+    };
+  }
+
+  function rawSampleEvidenceInfo(item = {}) {
+    const response = item.response || {};
+    const result = response.result || item.result || {};
+    const partial = partialEvidenceInfo(item);
+    const sha256 = firstValue(
+      item.raw_evidence_sha256,
+      item.rawEvidenceSha256,
+      item.target_raw_evidence_sha256,
+      item.targetRawEvidenceSha256,
+      response.raw_evidence_sha256,
+      result.targetRawEvidenceSha256,
+      result.rawEvidenceSha256,
+      result.target?.collection?.rawEvidenceSha256,
+      result.target?.fingerprint?.quality?.rawEvidenceSha256,
+      result.quality?.rawEvidenceSha256,
+    );
+    const explicitAvailability = firstValue(
+      item.samples_evidence_available,
+      item.samplesEvidenceAvailable,
+      response.samples_evidence_available,
+      result.samples_evidence_available,
+    );
+    const artifactId = firstValue(
+      partial.artifactId,
+      item.artifact_id,
+      item.artifactId,
+      response.artifact_id,
+    );
+    return {
+      available: Boolean(artifactId) && (explicitAvailability === true || Boolean(sha256)),
+      artifactId: artifactId ? String(artifactId) : "",
+      sha256: sha256 ? String(sha256) : "",
+    };
+  }
+
   return Object.freeze({
     statusLabels,
     decisionStatusLabels,
@@ -725,5 +807,8 @@
     referenceSelection,
     mappingEnabledState,
     mergeTargetModelMappings,
+    conflictBatchId,
+    referenceCollectionSummary,
+    rawSampleEvidenceInfo,
   });
 });
